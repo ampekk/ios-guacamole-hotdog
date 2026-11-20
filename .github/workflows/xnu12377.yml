@@ -14,10 +14,14 @@ jobs:
           git init dxb
           git -C dxb fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build 663906528d1cd5ea8fde7de6f16de73db9511549
           git -C dxb checkout -q FETCH_HEAD
-          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          mkdir -p dxb/patches/26.0
+          for f in xnu/patches/*.patch xnu/patches/*.sh; do
+            [ -f "$f" ] || continue
+            cp "$f" "dxb/patches/26.0/zz1-$(basename "$f")"
+          done
           for f in xnu/ios27/*.diff xnu/ios27/*.patch; do
             [ -f "$f" ] || continue
-            cp "$f" "dxb/patches/9000-$(basename "$f" | sed 's/\.\(diff\|patch\)$/.patch/')"
+            cp "$f" "dxb/patches/26.0/zz2-$(basename "$f" | sed 's/\.\(diff\|patch\)$/.patch/')"
           done
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           echo "patches: $(ls dxb/patches | wc -l)"
