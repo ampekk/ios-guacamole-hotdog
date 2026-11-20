@@ -38,7 +38,9 @@ if [ -z "$LOCALK" ] && [ ! -f "$K" ]; then
 fi
 [ -f "$K" ] || { echo "no $K in the artifact"; ls "xnu/out-$RUN"; exit 1; }
 mkdir -p shim/out
-python3 tools/mkadt.py "shim/out/${ADT_BASE}-hi.adt" --highmem "$ADT_FLAG"
+# ADT_EXTRA adds the final-boot flags when the Apple artifacts are present:
+#   ADT_EXTRA="--identity d73 --scale2 --ram5g" tools/hotdog-mkboot.sh ...
+python3 tools/mkadt.py "shim/out/${ADT_BASE}-hi.adt" --highmem "$ADT_FLAG" ${ADT_EXTRA:-}
 # sweettime: this machine's clock now, for the PM8150 RTC's offset (xnu 0133)
 ARGS="debug=0xc serial=3 cpus=${CPUS:-1} keepsyms=1 -enable_kprintf_spam -noprogress sweettouch=${TOUCH:-0} sweetkeys=${KEYS:-1} sweetusb=${USB:-0} wdt=-1 sweettime=$(date +%s) $EXTRA"
 python3 tools/mkpayload.py "$K" "shim/out/${ADT_BASE}-hi.adt" "shim/out/payload-${BIN_BASE}.bin" --cmdline "$ARGS"
