@@ -1,7 +1,8 @@
 # Handoff — hotdog (OnePlus 7T Pro) board support added, hardware unverified (2026-11-20, OpenCode)
 - Commit `618ef7b` on branch `hotdog` (off `ios27`): added `BOARD=hotdog` / `mkadt.py --hotdog` as a sibling
   of guacamole, plus `tools/hotdog-mkboot.sh`, `tools/mkhotdogboot.py`, README device-support table and
-  `docs/hotdog.md`. Pushed to the user's fork `ampekk/ios-guacamole` (branches `ios27` base + `hotdog`).
+  `docs/hotdog.md`. All of it now lives in the fresh repo `ampekk/ios-guacamole-hotdog` on branch
+  `main` (single import commit `aa87c9b`); there is no inherited fork history.
 - Observation (local, offline): `python3 tools/mkadt.py /tmp/htd-test.adt --highmem --hotdog` succeeds
   (11912 B with the Apple firmware blobs absent), dumps `hotdog,wcn3990`, `qcom,sm8150`, canvas 1125x2436
   and `sweet-fbcon` 1440x3120. `bash -n` and `py_compile` pass for every changed script. No kernel build
