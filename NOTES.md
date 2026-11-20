@@ -1,3 +1,39 @@
+# Handoff — first hotdog hardware boot test done; full iOS blocked on Mac-built artifacts (2026-11-20, OpenCode)
+- Device is connected and is a real hotdog: `adb devices -l` -> `8754d85f ... product:OnePlus7TPro
+  model:HD1911 device:OnePlus7TPro transport_id:1`, recovery, adb shell is uid=0. `/proc/cmdline`:
+  `androidboot.project_codename=hotdog androidboot.platform_name=SM8150 androidboot.slot_suffix=_b
+  androidboot.prj_version=19801 androidboot.hw_version=14 androidboot.rf_version=4
+  msm_drm.dsi_display0=dsi_samsung_oneplus_dsc_cmd_display: panel_type=normal`. The prj/hw/rf versions
+  differ from guacamole's 1/21/4, so the Wi-Fi `bdwlan.b<id>` must be re-derived (docs/hotdog.md).
+- Stock `boot_b` pulled read-only from `/dev/block/by-name/boot_b` into
+  `/home/ampekk/backups/hotdog-stock_boot_b.img` (100663296 B; header v2, page 4096, kernel 49111064 B,
+  kaddr 0x8000, DTB 9053968 B, dtb_addr 0x1f00000) so the DTB comes from this phone. NOT committed to git.
+- Shim built here with `PATH=/usr/local/bin:$PATH BOARD=hotdog sh shim/build.sh` (cross-gcc present):
+  `shim/out/Image` 212992 B, SHA-256 `966d8b492ae00eea3f233cdd69250346f5e618c0160f82f591a44ec1542ae8d7`.
+- Boot test 1: `fastboot boot /tmp/hotdog-shim-test.img` (wrapped with `tools/mkguacboot.py`, stock
+  boot_b DTB) -> `Sending OKAY / Booting OKAY`; adb/fastboot disappeared, i.e. our image executed.
+  After ~3 min the shim's reset landed back in fastboot, as designed.
+- Boot test 2 (the one left running): a temporary shim copy with its 3-minute probe hold changed to
+  12 h, rebuilt and wrapped as `/tmp/hotdog-shim-hold.img`, SHA-256
+  `b99e91b8a5df9d5d7ea6d997239de32aa623dc7898dfabd8f062c225f36144f1`. `fastboot boot` returned OKAY
+  and the device is executing it now (no adb/fastboot). This is a SHIM/console test boot, not iOS.
+- BLOCKER for full iOS (needs the user's Mac, cannot be done in this Linux session):
+  1. No XNU kernel binary. `xnu/ios27/README.md`: iOS 27 kernel is built from the separate
+     `work/xnu-12377` tree (Apple xnu-12377.121.6 + all SWEET diffs) on macOS/Xcode with a KDK;
+     that tree, the KDK and any prebuilt `mach.development.sweet` are absent here. blacktop's
+     darwin-xnu-build supports macOS up to 26.5, and the repo's CI workflow only builds xnu-8796
+     (iOS 16), so CI cannot produce this kernel.
+  2. No iOS root image. `tools/mkios27root-mac.sh` needs `research/ios27.2/{os-root.tar,
+     systemos-cryptex.tar,appos-cryptex.tar,overlay/*-lowered.tar}` from the IPSW plus macOS
+     `hdiutil`/`sudo`; none of those tars or a prebuilt root image exist locally.
+  Without these the kernel has nothing to boot and no root filesystem to mount. Do not flash
+  anything to userdata until the user supplies them.
+- Next concrete action (user, on the Mac): build the kernel from `work/xnu-12377` with all
+  `xnu/ios27/*.diff` applied and build the root with `tools/mkios27root-mac.sh`; stage the root into
+  the phone's `userdata` (`ufsroot=ios26`), copy the GPU/haptic/lens firmware from this hotdog, then
+  `tools/hotdog-mkboot.sh RUN_ID /home/ampekk/backups/hotdog-stock_boot_b.img shim/out/Image ...` and
+  `tools/mktripleboot.py`, then `fastboot boot` the triple image.
+
 # Handoff — hotdog (OnePlus 7T Pro) board support added, hardware unverified (2026-11-20, OpenCode)
 - Commit `618ef7b` on branch `hotdog` (off `ios27`): added `BOARD=hotdog` / `mkadt.py --hotdog` as a sibling
   of guacamole, plus `tools/hotdog-mkboot.sh`, `tools/mkhotdogboot.py`, README device-support table and
