@@ -1,0 +1,54 @@
+--- a/bsd/dev/redwood_apple80211.c
++++ b/bsd/dev/redwood_apple80211.c
+@@ -462,7 +462,13 @@
+ 	unsigned unknown = 0;
+ 	int error;
+ 
+-	if (request->req_len != sizeof(*asked)) {
++	/*
++	 * iOS 27.2 (24B119 IO80211, the scan request builder at 0x28c9b679c) sends 5528 bytes: the iOS 16.5 record with
++	 * the same offsets up to the names (version, bssid +8, ssid length +0x10, scan type +0x34, dwell +0x3c, channel
++	 * count +0x44, channels +0x48, flags +0x1308, name count +0x1314, names of 56 bytes) and 72 more bytes at the end
++	 * (a u64 at +0x1590). Only the iOS 16.5 part is read. Was: EINVAL, so Settings scanned forever, nothing listed.
++	 */
++	if (request->req_len != sizeof(*asked) && request->req_len != 5528) {
+ 		return EINVAL;
+ 	}
+ 	if (!redwood_sta_present()) {
+@@ -523,8 +529,34 @@
+ 	}
+ 	asked = kalloc_data(sizeof(*asked), Z_WAITOK | Z_ZERO);
+ 	what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
+-	if (asked == NULL || what == NULL || (error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest))) != 0) {
+-		error = asked == NULL || what == NULL ? ENOMEM : error;
++	if (asked == NULL || what == NULL) {
++		error = ENOMEM;
++		goto out;
++	}
++	if (request->req_len == 656) {
++		/*
++		 * iOS 27.2 (24B119 IO80211 _performAssociation, record at sp+0x218): 656 bytes. The authentication pair
++		 * is two u32 at +0x8/+0xc (iOS 16.5: u16 at +6/+8), so everything after it is 4 bytes later: name
++		 * length +0x10, name +0x14, access point +0x34, key version/length/cipher +0x3c/+0x40/+0x44, key +0x4c.
++		 * Read as 16.5's layout it gave "a name of 8 bytes ... a key of 1 bytes of kind 32" and EINVAL.
++		 */
++		uint8_t raw[0x4c + 64];
++		if ((error = copyin(request->req_data, raw, sizeof(raw))) != 0) {
++			goto out;
++		}
++		uint32_t a_lo, a_up;
++		memcpy(&asked->version, raw, 4);
++		memcpy(&asked->mode, raw + 4, 2);
++		memcpy(&a_lo, raw + 8, 4);
++		memcpy(&a_up, raw + 0xc, 4);
++		asked->auth_lower = (uint16_t)a_lo;
++		asked->auth_upper = (uint16_t)a_up;
++		/* through the record's base: a copy starting at &asked->ssid_length would be bounded to that one field
++		 * by the kernel's checked memcpy ("string operation caused an overflow", 2026-11-14) */
++		memcpy((uint8_t *)asked + offsetof(struct apple80211_assoc, ssid_length), raw + 0x10,
++		    offsetof(struct apple80211_assoc, rest) - offsetof(struct apple80211_assoc, ssid_length));
++		memset_s(raw, sizeof(raw), 0, sizeof(raw));
++	} else if ((error = copyin(request->req_data, asked, offsetof(struct apple80211_assoc, rest))) != 0) {
+ 		goto out;
+ 	}
+ 	/* (lengths and kinds only: the name, the access point and the key stay out of the log) */

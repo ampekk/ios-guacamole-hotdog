@@ -1,0 +1,31 @@
+--- a/bsd/kern/kern_exec.c	2026-11-14 08:28:05.266707303 +0000
++++ b/bsd/kern/kern_exec.c	2026-11-14 08:28:05.285063155 +0000
+@@ -4478,6 +4478,28 @@
+ 			if ((error = copyin(px_args.attrp, &px_sa, px_sa_offset)) != 0) {
+ 				goto bad;
+ 			}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			/*
++			 * SWEET: Darwin 26 (iOS 27) libsystem_kernel passes a 256-byte _posix_spawnattr (ours: 248).
++			 * Offsets 0..168 match; then iOS 27 has u32 sec_flags @172, u8 use_sanitizers @176,
++			 * crash_count @180, throttle_timeout @184, kqworkloop soft/hard @188/192, conclave mem @196,
++			 * pointers @200. Read as our layout, launchd's throttle_timeout became the kqworkloop HARD limit,
++			 * so daemons exceeding it got the task fatal port and were SIGKILLed (ns 2 code 9).
++			 * Remap the tail; sec_flags stays 0 as before (the iOS 27 bit meanings are not verified).
++			 */
++			if (px_args.attr_size == 256 && px_sa_offset == 192) {
++				uint32_t tail27[7];     /* offsets 172..199 */
++				if ((error = copyin(px_args.attrp + 172, tail27, sizeof(tail27))) != 0) {
++					goto bad;
++				}
++				px_sa.psa_sec_flags = 0;
++				px_sa.psa_crash_count = tail27[2];
++				px_sa.psa_throttle_timeout = tail27[3];
++				px_sa.psa_kqworkloop_soft_limit = tail27[4];
++				px_sa.psa_kqworkloop_hard_limit = tail27[5];
++				px_sa.psa_conclave_mem_limit = tail27[6];
++			}
++#endif
+ 
+ 			imgp->ip_px_sa = &px_sa;
+ 		}

@@ -1,0 +1,77 @@
+diff --git a/UniXNU/scripts/build-adreno-metal-bridge.py b/UniXNU/scripts/build-adreno-metal-bridge.py
+index 91147a3..04a004c 100644
+--- a/UniXNU/scripts/build-adreno-metal-bridge.py
++++ b/UniXNU/scripts/build-adreno-metal-bridge.py
+@@ -50,7 +50,13 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
+     '0040-unixnu-runtime-on-development-555b13d5.patch',
+     # A driver that compiles inside the call: pipeline makings stay on the asking thread (METAL2VULKAN_COMPILE_ON_ASKING_THREAD=1)
+     # instead of a thread started for each, which a thread without a quality-of-service class waited for.
+-    '0041-compile-on-the-asking-thread.patch']]
++    '0041-compile-on-the-asking-thread.patch',
++    # A program waiting for room that sees no progress for 50 ms hands its slot to the lowering thread again, then lowers on its own
++    # thread (Candy Crush froze 10 s with its main thread in wait_for_room and the lowering thread parked: a lost hand-off).
++    '0042-wait-for-room-recovers-a-lost-hand-off.patch',
++    # A vertex attribute the function reads and the descriptor lacks is left unfetched instead of refusing the pipeline, as Apple's
++    # driver makes such a pipeline (Minecraft's bgfx pipelines have an empty vertex descriptor; all of them were refused: black).
++    '0043-vertex-attributes-absent-from-the-descriptor.patch']]
+ 
+ 
+ def git_tree(*steps):
+diff --git a/UniXNU/drivers/AdrenoMetal/bridge/patches/0043-vertex-attributes-absent-from-the-descriptor.patch b/UniXNU/drivers/AdrenoMetal/bridge/patches/0043-vertex-attributes-absent-from-the-descriptor.patch
+new file mode 100644
+index 0000000..32842e8
+--- /dev/null
++++ b/UniXNU/drivers/AdrenoMetal/bridge/patches/0043-vertex-attributes-absent-from-the-descriptor.patch
+@@ -0,0 +1,52 @@
++--- a/crates/metal2vulkan/src/pipeline/link/vertex.rs
+++++ b/crates/metal2vulkan/src/pipeline/link/vertex.rs
++@@ -185,11 +185,14 @@
++     }
++     let mut out = BTreeMap::new();
++     for (&a, &numeric) in attributes {
++-        let attr = desc
++-            .and_then(|d| d.attributes.get(&a))
++-            .ok_or(Error::InvalidDescriptor(DescriptorError::VertexAttribute {
++-                attribute: a,
++-            }))?;
+++        // ios-sweet 0043: an attribute the function reads and the descriptor lacks is left out of
+++        // the projection (no fetch: the location has no vertex attribute, so it reads whatever
+++        // the device leaves there), as Apple's driver makes such a pipeline without validation
+++        // and reads undefined values. Minecraft (bgfx, `xlatMtlMain`) makes such pipelines with
+++        // an empty vertex descriptor, and refusing them left every draw undrawn.
+++        let Some(attr) = desc.and_then(|d| d.attributes.get(&a)) else {
+++            continue;
+++        };
++         let layout = desc.and_then(|d| d.layouts.get(&attr.buffer_index)).ok_or(
++             Error::InvalidDescriptor(DescriptorError::VertexLayout {
++                 layout: attr.buffer_index,
++@@ -388,11 +391,9 @@
++         if fetch != VertexFetch::FixedFunction {
++             continue;
++         }
++-        let attr = desc
++-            .and_then(|d| d.attributes.get(&a))
++-            .ok_or(Error::InvalidDescriptor(DescriptorError::VertexAttribute {
++-                attribute: a,
++-            }))?;
+++        let Some(attr) = desc.and_then(|d| d.attributes.get(&a)) else {
+++            continue; // absent from the descriptor (0043): no fetch, no conversion to note
+++        };
++         let e = encoding(attr.format)?;
++         let f32_read = f32_reads.contains(&a);
++         if e.is_normalized() {
++@@ -443,6 +444,14 @@
++     let numeric: BTreeMap<u32, IoNumeric> = used.iter().map(|(a, (n, _))| (*a, *n)).collect();
++     let (resolved, moved) = resolve(desc, &numeric, p, pulled_vertex_buffers, false)?;
++     for (a, (_, fetch)) in &used {
+++        // Absent from the descriptor (0043): resolve left it out, and the stage reads it as a
+++        // fixed-function input with no vertex attribute.
+++        if !resolved.contains_key(a)
+++            && *fetch == VertexFetch::FixedFunction
+++            && !desc.is_some_and(|d| d.attributes.contains_key(a))
+++        {
+++            continue;
+++        }
++         // The stage was compiled under another projection (a `Compiled` stage source whose
++         // `LowerInputs` do not fit this descriptor).
++         if resolved.get(a).map(fetch_of) != Some(*fetch) {

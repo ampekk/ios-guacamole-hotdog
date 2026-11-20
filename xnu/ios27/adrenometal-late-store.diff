@@ -1,0 +1,75 @@
+--- research/ios27.2/NativeBridgeMetalFrontend.mm.before-dumpsampled	2026-11-18 11:47:50.889125391 +0000
++++ work/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm	2026-11-18 12:03:02.715994018 +0000
+@@ -2648,6 +2648,19 @@
+ - (void)setFragmentBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:2];}
+ - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:1];}
+ - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:2];}
++// 2026-11-18: late store actions (a pass begun with MTLStoreActionUnknown). Missing, they went to forwardInvocation and did nothing:
++// the attachment was lowered as DontCare and Unity's frames never left tile memory. The options change nothing (as on Apple's GPUs).
++// A refused one (an action the descriptor already knew, which Metal's validation stops) is logged, not a refused command buffer.
++- (void)lateStore:(uint32_t)which index:(NSUInteger)i action:(MTLStoreAction)a {
++ ENCODE(if(!nmb_encoder_set_store_action(self.handle,which,(uint32_t)i,(uint64_t)a))
++         GLOG(@"native-metal: late store action %u/%lu = %lu refused: %@",which,(unsigned long)i,(unsigned long)a,lastError()));
++}
++- (void)setColorStoreAction:(MTLStoreAction)a atIndex:(NSUInteger)i {[self lateStore:0 index:i action:a];}
++- (void)setDepthStoreAction:(MTLStoreAction)a {[self lateStore:1 index:0 action:a];}
++- (void)setStencilStoreAction:(MTLStoreAction)a {[self lateStore:2 index:0 action:a];}
++- (void)setColorStoreActionOptions:(MTLStoreActionOptions)o atIndex:(NSUInteger)i {(void)o;(void)i;}
++- (void)setDepthStoreActionOptions:(MTLStoreActionOptions)o {(void)o;}
++- (void)setStencilStoreActionOptions:(MTLStoreActionOptions)o {(void)o;}
+ - (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
+  for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:2];
+ }
+@@ -3857,6 +3870,10 @@
+  for(unsigned i=0;i<8;i++) {
+   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];if(a.pixelFormat==MTLPixelFormatInvalid)continue;
+   [s appendFormat:@" c%u=f%lu%@",i,(unsigned long)a.pixelFormat,a.blendingEnabled?@"b":@""];
++  // 2026-11-18: the blend itself, (rgb op:src/dst alpha op:src/dst) in MTLBlendOperation/MTLBlendFactor numbers.
++  if(a.blendingEnabled)[s appendFormat:@"(%lu:%lu/%lu %lu:%lu/%lu)",(unsigned long)a.rgbBlendOperation,(unsigned long)a.sourceRGBBlendFactor,
++                        (unsigned long)a.destinationRGBBlendFactor,(unsigned long)a.alphaBlendOperation,(unsigned long)a.sourceAlphaBlendFactor,
++                        (unsigned long)a.destinationAlphaBlendFactor];
+   if(a.writeMask!=MTLColorWriteMaskAll)[s appendFormat:@"m%lu",(unsigned long)a.writeMask];
+  }
+  if(d.depthAttachmentPixelFormat)[s appendFormat:@" d=f%lu",(unsigned long)d.depthAttachmentPixelFormat];
+--- research/ios27.2/NativeMetalObjects.rs.before-latestore	2026-11-18 12:02:49.601002707 +0000
++++ work/UniXNU/drivers/AdrenoMetal/bridge/NativeMetalObjects.rs	2026-11-18 12:02:49.618063059 +0000
+@@ -3167,6 +3167,28 @@
+     })
+ }
+ 
++/// `setColorStoreAction:atIndex:` (which 0, index), `setDepthStoreAction:` (1), `setStencilStoreAction:` (2): the store
++/// action of an attachment the pass descriptor left `Unknown` (2026-11-18: Unity begins every pass that way and names the
++/// action just before endEncoding; without this the action stayed `Unknown`, lowered as `DontCare`, and nothing it drew
++/// reached the drawable: Subway Surfers all black).
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_encoder_set_store_action(encoder: *mut NmbEncoder, which: u32, index: u32, action: u64) -> bool {
++    guard(false, || {
++        let action = StoreAction::from_raw(action).map_err(e("store action"))?;
++        match get_mut(encoder)? {
++            NmbEncoder::Render(r) => match which {
++                0 => r.set_color_store_action(action, index),
++                1 => r.set_depth_store_action(action),
++                2 => r.set_stencil_store_action(action),
++                _ => return Err(format!("store action of attachment kind {which}")),
++            },
++            _ => return Err("store action on an encoder that is not a render encoder".to_string()),
++        }
++        .map_err(e("set store action"))?;
++        Ok(true)
++    })
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_encoder_set_texture(encoder: *mut NmbEncoder, stage: u32, texture: *mut NmbTexture, index: u32) -> bool {
+     guard(false, || {
+--- research/ios27.2/NativeMetalObjects.h.before-latestore	2026-11-18 12:02:49.602002707 +0000
++++ work/UniXNU/drivers/AdrenoMetal/bridge/NativeMetalObjects.h	2026-11-18 12:02:49.619566892 +0000
+@@ -366,6 +366,8 @@
+ bool nmb_encoder_set_buffer_offset(NmbEncoder *, uint32_t stage, uint64_t offset, uint32_t index);
+ bool nmb_encoder_set_bytes(NmbEncoder *, uint32_t stage, const void *bytes, size_t length, uint32_t index);
+ bool nmb_encoder_set_texture(NmbEncoder *, uint32_t stage, NmbTexture *, uint32_t index);
++// A render encoder's late store action (which 0 color at index, 1 depth, 2 stencil), MTLStoreAction numbers.
++bool nmb_encoder_set_store_action(NmbEncoder *, uint32_t which, uint32_t index, uint64_t action);
+ bool nmb_encoder_set_sampler(NmbEncoder *, uint32_t stage, NmbSampler *, uint32_t index);
+ // The tile stage of a render encoder is stage 3 of the nmb_encoder_set_* binders. A tile pipeline is a render pipeline state made
+ // from a tile descriptor (newRenderPipelineStateWithTileDescriptor:): formats are MTLPixelFormat values, 0 for no attachment.

@@ -1,0 +1,58 @@
+--- /sessions/rcw-015jkmz8ksajvzi4ej7gdzqc/mnt/ios-sweet-latest/research/ios27.2/kernel-backup/kern_event.c.before-bigkev	2026-11-16 23:11:19.191419631 +0000
++++ work/xnu-12377/bsd/kern/kern_event.c	2026-11-16 23:11:19.212019131 +0000
+@@ -8922,12 +8922,25 @@
+ 		total_size += event_msg->dv[i].data_length;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET (2026-11-16): iOS 27's IO80211 reads a 540-byte association record from the
++	 * APPLE80211_M_ASSOC_DONE payload (status at +532, "status given" at +536). A message larger
++	 * than one mbuf goes in a cluster, up to MCLBYTES.
++	 */
++	if (total_size > MCLBYTES) {
++		os_atomic_inc(&kevtstat.kes_toobig, relaxed);
++		return EMSGSIZE;
++	}
++	m = total_size > MLEN ? m_getcl(wait, MT_DATA, 0) : m_get(wait, MT_DATA);
++#else
+ 	if (total_size > MLEN) {
+ 		os_atomic_inc(&kevtstat.kes_toobig, relaxed);
+ 		return EMSGSIZE;
+ 	}
+ 
+ 	m = m_get(wait, MT_DATA);
++#endif
+ 	if (m == 0) {
+ 		os_atomic_inc(&kevtstat.kes_nomem, relaxed);
+ 		return ENOMEM;
+--- /sessions/rcw-015jkmz8ksajvzi4ej7gdzqc/mnt/ios-sweet-latest/research/ios27.2/kernel-backup/redwood_apple80211.c.before-assoc540	2026-11-16 23:11:19.194247798 +0000
++++ work/xnu-12377/bsd/dev/redwood_apple80211.c	2026-11-16 23:11:19.214507840 +0000
+@@ -668,18 +668,20 @@
+ 		break;
+ 	case REDWOOD_STA_JOIN_DONE: {
+ 		/*
+-		 * iOS 27's async-association event handler reads two 32-bit words after the event code.
+-		 * A missing payload leaves its prefilled 0xAAAAAAAA sentinels in place, which it maps to
+-		 * Apple80211 error -3902 before it ever asks request 21 for join_result. Zero both words
+-		 * so the handler takes that request-21 path; it carries the actual success/auth/timeout
+-		 * result and remains the single source of truth.
++		 * 2026-11-16 (Claude, from IO80211 27.2 _eventRead -> 0x28c9d3b9c): the ASSOC_DONE payload (after
++		 * the interface name) is a 540-byte record. The handler reads +536: 0 = ask request 21 for the
++		 * result (our join_result: 1 -> success 0, else an Apple80211 error), nonzero = use +532 directly.
++		 * +520/+528 are only logged ("join_status:%d/%d"). With 8 bytes (or none) the rest kept wifid's
++		 * 0xAAAAAAAA fill, so +536 != 0 and +532 = 0xAAAAAAAA -> -3902 on every join (wifi-join3.log:
++		 * "_dispatchAsyncAssocEvent@6567:-3902 join_status:-1431655766/-1431655766"). All zero: request 21.
++		 * Needs the kern_event.c cluster change (one mbuf holds 224 bytes).
+ 		 */
+-		uint32_t assoc_event_words[2] = { 0, 0 };
++		static const uint8_t assoc_record[540];
+ 
+ 		lck_mtx_lock(&apple80211_lock);
+ 		join_result = status == 0 ? 1 : status == EAUTH ? 21 : status == ETIMEDOUT ? 9 : 2;
+ 		lck_mtx_unlock(&apple80211_lock);
+-		post(EVENT_ASSOC_DONE, assoc_event_words, sizeof(assoc_event_words));
++		post(EVENT_ASSOC_DONE, assoc_record, sizeof(assoc_record));
+ 		break;
+ 	}
+ 	case REDWOOD_STA_LINK: {

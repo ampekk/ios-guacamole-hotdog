@@ -1,0 +1,132 @@
+--- ../../research/ios27.2/kernel-backup/sleh.c.before-emul-atomic	2026-11-17 00:48:35.640864025 +0000
++++ osfmk/arm64/sleh.c	2026-11-17 00:48:42.911756663 +0000
+@@ -1197,6 +1197,8 @@
+  * logged (first 64) with the process, pc and instruction word, then raised as before (SIGILL).
+  */
+ #include <arm/atomic.h>
++#include <kern/clock.h>
++#include <kern/misc_protos.h>
+ static unsigned sweet_emul_logged, sweet_undef_logged;
+ extern void proc_selfname(char *buf, int size);  /* bsd/kern/proc_info / kern_proc.c */
+ 
+@@ -1217,6 +1219,84 @@
+ 	}
+ }
+ 
++/*
++ * 2026-11-17: user memory for the LRCPC2 emulation is accessed single-copy atomically. copyin()/copyout() of fewer
++ * than 16 bytes copy BYTE BY BYTE (BCOPY_IMPL), so an emulated STLUR of a pointer was visible to the other cores
++ * half written, and an emulated LDAPUR could read one half old, one half new: with 8 cores that tears the
++ * acquire/release atomics libdispatch and others use (suspected in locationd's spin in _dispatch_wait_for_enqueuer
++ * and its SIGBUS on a CFString where a voucher belongs). Aligned 4/8-byte accesses use copy{in,out}_atomic{32,64};
++ * an aligned 2-byte load reads its containing aligned word atomically. Unaligned accesses (not atomic in hardware
++ * either) and 2-byte stores (no user-memory compare-and-swap here) keep the byte copy.
++ */
++static int
++sweet_user_load(user_addr_t addr, unsigned bytes, uint64_t *v)
++{
++	*v = 0;
++	if (bytes == 8 && !(addr & 7)) {
++		return copyin_atomic64(addr, v);
++	}
++	if (bytes == 4 && !(addr & 3)) {
++		uint32_t w;
++		int err = copyin_atomic32(addr, &w);
++		if (!err) {
++			*v = w;
++		}
++		return err;
++	}
++	if (bytes == 2 && !(addr & 1)) {
++		uint32_t w;
++		int err = copyin_atomic32(addr & ~(user_addr_t)3, &w);
++		if (!err) {
++			*v = (w >> (8 * (addr & 3))) & 0xffff;
++		}
++		return err;
++	}
++	return copyin(addr, v, bytes);  /* little-endian: the low bytes of *v */
++}
++
++static int
++sweet_user_store(user_addr_t addr, unsigned bytes, uint64_t v)
++{
++	if (bytes == 8 && !(addr & 7)) {
++		return copyout_atomic64(v, addr);
++	}
++	if (bytes == 4 && !(addr & 3)) {
++		return copyout_atomic32((uint32_t)v, addr);
++	}
++	return copyout(&v, addr, bytes);
++}
++
++/*
++ * How often user code traps here: every LRCPC2 site in the shared cache (acquire/release atomics with an offset)
++ * costs an exception. One line at most every 10 s: the count since the last line, LRCPC2 loads and stores apart.
++ */
++static uint64_t sweet_emul_total, sweet_emul_ld, sweet_emul_st, sweet_emul_last;
++
++static void
++sweet_emul_count(int kind)      /* 0 other, 1 LDAPUR, 2 STLUR */
++{
++	os_atomic_inc(&sweet_emul_total, relaxed);
++	if (kind == 1) {
++		os_atomic_inc(&sweet_emul_ld, relaxed);
++	} else if (kind == 2) {
++		os_atomic_inc(&sweet_emul_st, relaxed);
++	}
++	uint64_t now = mach_absolute_time(), last = os_atomic_load(&sweet_emul_last, relaxed), ns;
++	absolutetime_to_nanoseconds(now - last, &ns);
++	if (ns < 10ull * NSEC_PER_SEC || !os_atomic_cmpxchg(&sweet_emul_last, last, now, relaxed)) {
++		return;
++	}
++	uint64_t total = os_atomic_xchg(&sweet_emul_total, 0, relaxed);
++	uint64_t ld = os_atomic_xchg(&sweet_emul_ld, 0, relaxed), st = os_atomic_xchg(&sweet_emul_st, 0, relaxed);
++	if (last == 0) {
++		return;                 /* first call: just starts the clock */
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	printf("SWEET EMUL: %llu emulated in %llu ms (%llu/s): LDAPUR %llu, STLUR %llu, other %llu; now in %s\n",
++	    total, ns / NSEC_PER_MSEC, total * NSEC_PER_SEC / (ns ? ns : 1), ld, st, total - ld - st, name);
++}
++
+ static void
+ sweet_emul_note(const char *what, arm_saved_state_t *state, uint32_t instr)
+ {
+@@ -1251,14 +1331,14 @@
+ 		if (opc == 0) {                 /* STLUR */
+ 			v = sweet_xreg(state, rt, false);
+ 			__builtin_arm_dmb(DMB_ISH);
+-			if (copyout(&v, addr, bytes) != 0) {
++			if (sweet_user_store(addr, bytes, v) != 0) {
+ 				return false;
+ 			}
+ 		} else {
+ 			if ((opc == 2 && size == 3) || (opc == 3 && size >= 2)) {
+ 				return false;   /* unallocated */
+ 			}
+-			if (copyin(addr, &v, bytes) != 0) {
++			if (sweet_user_load(addr, bytes, &v) != 0) {
+ 				return false;
+ 			}
+ 			__builtin_arm_dmb(DMB_ISH);
+@@ -1272,7 +1352,8 @@
+ 			sweet_set_xreg(state, rt, v);
+ 		}
+ 		sweet_emul_note(opc == 0 ? "STLUR" : "LDAPUR", state, instr);
+-		goto done;
++		sweet_emul_count(opc == 0 ? 2 : 1);
++		goto lrcpc_done;
+ 	}
+ 	if (instr == 0xd500401f) {              /* CFINV */
+ 		cpsr ^= SWEET_PSR_C;
+@@ -1443,6 +1524,8 @@
+ flags:
+ 	saved_state64(state)->cpsr = cpsr;
+ done:
++	sweet_emul_count(0);
++lrcpc_done:
+ 	saved_state64(state)->pc += 4;
+ 	return true;
+ }

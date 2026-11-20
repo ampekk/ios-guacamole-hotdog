@@ -1,0 +1,132 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -419,7 +419,7 @@
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ 	int presentGPU(const uint8_t *rec);
+-	bool presentComposed(const uint8_t *rec);
++	bool presentComposed(const uint8_t *rec, uintptr_t dst = 0, bool force = false);
+ 	uint32_t     *fCompose;       /* 0170: fLogicalW x fLogicalH BGRA, cached */
+ 	uint32_t     *fComposeX;      /* 0170: per destination column of a layer, its source column */
+ 	void pauseConsole(void);
+@@ -734,11 +734,12 @@
+ 	bool tried, ok;
+ 	volatile uint32_t *mdp;
+ 	uint64_t pa[2];
++	uintptr_t cpu[2];               /* CPU views: 0 = the panel surface (fPixels), 1 = the second buffer (write-combined) */
+ 	unsigned front;                 /* the buffer the pipes read (once taken) */
+ 	unsigned pending;               /* 1 + the buffer to flip to once pending_fence passes; 0: none */
+ 	uint32_t pending_fence;
+ 	bool latching;                  /* flip written, FLUSH bits not yet taken */
+-	uint32_t flips, busy, cpu_back, slow;
++	uint32_t flips, busy, cpu_back, slow, cpu_flip;
+ } sweet_fbflip;
+ 
+ static inline uint32_t
+@@ -805,6 +806,24 @@
+ 	return fbflip_settled();
+ }
+ 
++/*
++ * 2026-11-17 (dashes back with the scheduler change): the CPU fallback (frames the GPU present cannot take: video
++ * layers, a translucent top layer, more than two layers) flipped back to buffer 0 and then wrote the frame into the
++ * buffer being scanned out: the original dash bug, now frequent. Instead it composes the whole frame into the buffer
++ * the pipes do not read and flips to it, like the GPU present. Returns that buffer's index and CPU address once
++ * every earlier flip has been taken (up to 20 ms), else false (the caller falls back to the old way).
++ */
++static bool
++fbflip_cpu_back(unsigned *b, uintptr_t *dst)
++{
++	if (!sweet_fbflip.ok || sweet_fbflip.cpu[0] == 0 || sweet_fbflip.cpu[1] == 0 || !fbflip_wait(20)) {
++		return false;
++	}
++	*b = sweet_fbflip.front ^ 1u;
++	*dst = sweet_fbflip.cpu[*b];
++	return true;
++}
++
+ /* Before the CPU writes the panel (it writes the first buffer): everything settled, the pipes back on buffer 0. */
+ static void
+ fbflip_for_cpu(void)
+@@ -988,9 +1007,10 @@
+ 				IOLog("SWEET FB: 5s: swaps that kept an earlier layer: %u\n", sweet_fb_stats.persisted);
+ 			}
+ 			if (sweet_fbflip.ok) {
+-				IOLog("SWEET FB: 5s: page flips %u, frames that waited for a flip %u, back to buffer 0 for the CPU %u, slow %u\n",
+-				    sweet_fbflip.flips, sweet_fbflip.busy, sweet_fbflip.cpu_back, sweet_fbflip.slow);
+-				sweet_fbflip.flips = sweet_fbflip.busy = sweet_fbflip.cpu_back = sweet_fbflip.slow = 0;
++				IOLog("SWEET FB: 5s: page flips %u (CPU-composed into the hidden buffer %u), frames that waited for a flip %u, "
++				    "back to buffer 0 for the CPU %u, slow %u\n", sweet_fbflip.flips, sweet_fbflip.cpu_flip, sweet_fbflip.busy,
++				    sweet_fbflip.cpu_back, sweet_fbflip.slow);
++				sweet_fbflip.flips = sweet_fbflip.busy = sweet_fbflip.cpu_back = sweet_fbflip.slow = sweet_fbflip.cpu_flip = 0;
+ 			}
+ 			if (sweet_fb_stats.top_only != 0) {
+ 				IOLog("SWEET FB: 5s: multi-layer frames shown on the GPU (opaque top layer, bottom layer around it): %u\n",
+@@ -1101,12 +1121,29 @@
+ 			if (sweet_fb_metal) {
+ 				sweet_fb_stats.cpu_metal++;
+ 			}
++			unsigned back = 0;
++			uintptr_t dst = 0;
++			bool flipped = false;
+ 			if (sweet_fbflip.ok && fb->fPresentLock != NULL) {
++				/* the whole frame into the hidden buffer, then flip (fbflip_cpu_back) */
+ 				IOLockLock(fb->fPresentLock);
+-				fbflip_for_cpu();               /* the CPU writes buffer 0: show buffer 0 */
++				if (fbflip_cpu_back(&back, &dst) && fb->presentComposed(rec, dst, true)) {
++					if (back == 0 && fb->fSurface != NULL && fb->fSurface->memory != NULL) {
++						/* buffer 0 is the panel surface's (cached) mapping: clean it to memory first */
++						fb->fSurface->memory->performOperation(kIOMemoryIncoherentIOStore, 0,
++						    fb->fSurface->memory->getLength());
++					}
++					__asm__ volatile ("dsb sy" ::: "memory");
++					fbflip_program(back);
++					sweet_fbflip.cpu_flip++;
++					flipped = true;
++				}
++				if (!flipped) {
++					fbflip_for_cpu();       /* the CPU writes buffer 0: show buffer 0 */
++				}
+ 				IOLockUnlock(fb->fPresentLock);
+ 			}
+-			if (!fb->presentComposed(rec)) {        /* 0170 */
++			if (!flipped && !fb->presentComposed(rec)) {        /* 0170 */
+ 				fb->present(rec);
+ 			}
+ 		}
+@@ -1554,6 +1591,8 @@
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	sweet_fbflip.pa[0] = panel_pa;
+ 	sweet_fbflip.pa[1] = second;
++	sweet_fbflip.cpu[0] = panel_cpu;
++	sweet_fbflip.cpu[1] = smap->getVirtualAddress();
+ 	sweet_fbflip.front = 0;
+ 	sweet_fbflip.ok = true;
+ 	IOLog("SWEET FB: page flip on: buffers %#llx and %#llx (%llu KB), pipes VIG0/VIG1, CTL0 flush %#x\n",
+@@ -2425,7 +2464,7 @@
+  * scaled by fColMap. False: not for this path (present() shows it).
+  */
+ bool
+-AppleCLCD::presentComposed(const uint8_t *rec)
++AppleCLCD::presentComposed(const uint8_t *rec, uintptr_t dst, bool force)
+ {
+ 	if (!sweet_fb_compose || !fScaleUp || fColMap == NULL) {
+ 		return false;
+@@ -2441,7 +2480,7 @@
+ 			}
+ 		}
+ 	}
+-	if (layers == 0 || (layers == 1 && !scaled)) {
++	if (layers == 0 || (layers == 1 && !scaled && !force)) {
+ 		return false;
+ 	}
+ 	if (fCompose == NULL) {
+@@ -2609,7 +2648,7 @@
+ 	for (uint32_t py = 0; py < fHeight; py++) {
+ 		uint32_t ly = (uint32_t)(((uint64_t)py * fLogicalH) / fHeight);
+ 		const uint32_t *srow = fCompose + (uint64_t)ly * fLogicalW;
+-		uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++		uint32_t *drow = (uint32_t *)((dst != 0 ? dst : fPixels) + (uint64_t)py * fRowBytes);
+ 		for (uint32_t px = 0; px < fWidth; px++) {
+ 			drow[px] = srow[fColMap[px]];
+ 		}

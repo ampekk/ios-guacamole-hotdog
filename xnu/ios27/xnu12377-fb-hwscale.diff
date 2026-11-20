@@ -1,0 +1,270 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -755,9 +755,94 @@
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * 2026-11-17 hardware scaling. Every frame was stretched from CoreAnimation's logical 828x1792 to the 1440x3120 panel by
++ * the GPU blit (18 MB written a frame) and the display then read 18 MB a refresh. Each VIG pipe has a QSEED3 scaler
++ * (scanprobe 11-17: version 0x1004 at VIG + 0xa00, off, steps 1.0, preload x4 y3). Now the two page-flip buffers hold
++ * the logical frame (pitch rounded to 64 bytes), the GPU copies 1:1 and each pipe scales its half: VIG0 source columns
++ * [0, W/2) -> LM0's 720, VIG1 [W/2, W) -> LM1's 720 (828/1440 * 720 = 414 exactly: the halves meet without a phase
++ * offset). Bilinear (filter 3, alpha 1, no coefficient tables), steps in 1/2^21 (Linux dpu_plane.c, dpu_hw_util.c
++ * dpu_hw_setup_scaler3; separate INIT_* registers as the version is not 0x1002). The pipes are switched over on the
++ * first flip after setup (fbflip_program), together with the first logical frame. A panic restores the 1:1 setup on
++ * buffer 0 for the panic screen (sweet_console_panic_hook, serial_console.c). Boot-arg sweetfbhwscale=0: off.
++ */
++#define FBSCALE_QSEED3          0xa00u          /* VIG + 0xa00 */
++#define FBSCALE_SRC_SIZE        0x000u
++#define FBSCALE_SRC_XY          0x008u
++#define FBSCALE_OUT_SIZE        0x00cu
++#define FBSCALE_REQ_C0          0x108u          /* SSPP_SW_PIX_EXT_C0_REQ_PIXELS; C1C2 +0x10, C3 +0x20 */
++
++static struct {
++	bool on;                        /* the buffers hold logical frames (the next flip switches the pipes over) */
++	bool programmed;                /* the pipes scale */
++	uint32_t lw, lh, half, pitch, outw, outh, version;
++	uint32_t save_size[2], save_xy[2], save_stride[2], save_req[2][3], save_op[2];
++} sweet_fbscale;
++
++static void
++fbscale_program_pipes(void)
++{
++	static const uint32_t vig[2] = { FBFLIP_VIG0, FBFLIP_VIG1 };
++	const uint32_t size = (sweet_fbscale.lh << 16) | sweet_fbscale.half;
++	const uint32_t step_h = (uint32_t)(((uint64_t)sweet_fbscale.half << 21) / sweet_fbscale.outw);
++	const uint32_t step_v = (uint32_t)(((uint64_t)sweet_fbscale.lh << 21) / sweet_fbscale.outh);
++	for (unsigned p = 0; p < 2; p++) {
++		const uint32_t v = vig[p], q = vig[p] + FBSCALE_QSEED3;
++		fbflip_wr(v + FBSCALE_SRC_SIZE, size);
++		fbflip_wr(v + FBSCALE_SRC_XY, p * sweet_fbscale.half);
++		fbflip_wr(v + FBFLIP_YSTRIDE0, sweet_fbscale.pitch);
++		for (unsigned c = 0; c < 3; c++) {
++			fbflip_wr(v + FBSCALE_REQ_C0 + 0x10 * c, size);
++		}
++		fbflip_wr(q + 0x90, 0);                 /* PHASE_INIT_Y_H, _Y_V, _UV_H, _UV_V */
++		fbflip_wr(q + 0x94, 0);
++		fbflip_wr(q + 0x98, 0);
++		fbflip_wr(q + 0x9c, 0);
++		fbflip_wr(q + 0x10, step_h);            /* PHASE_STEP_Y_H */
++		fbflip_wr(q + 0x14, step_v);            /* PHASE_STEP_Y_V */
++		fbflip_wr(q + 0x18, step_h);            /* PHASE_STEP_UV_H */
++		fbflip_wr(q + 0x1c, step_v);            /* PHASE_STEP_UV_V */
++		fbflip_wr(q + 0x20, 0x03040304u);       /* PRELOAD: x 4, y 3 (QSEED3) */
++		fbflip_wr(q + 0x40, size);              /* SRC_SIZE_Y_RGB_A */
++		fbflip_wr(q + 0x44, size);              /* SRC_SIZE_UV */
++		fbflip_wr(q + 0x48, (sweet_fbscale.outh << 16) | sweet_fbscale.outw);   /* DST_SIZE */
++		/* OP_MODE last: enable, Y/RGB bilinear (3 << 16), not DX (bit 14), alpha (bit 10) bilinear (1 << 29), blend (31) */
++		fbflip_wr(q + 0x04, 1u | (3u << 16) | (1u << 14) | (1u << 10) | (1u << 29) | (1u << 31));
++	}
++	sweet_fbscale.programmed = true;
++}
++
++/* sweet_console_panic_hook: the panic screen is drawn 1:1 into buffer 0: the pipes back to how ABL set them */
++extern "C" void (*sweet_console_panic_hook)(void);
++static void
++fbscale_panic_restore(void)
++{
++	static const uint32_t vig[2] = { FBFLIP_VIG0, FBFLIP_VIG1 };
++	if (!sweet_fbflip.ok || sweet_fbflip.mdp == NULL) {
++		return;
++	}
++	for (unsigned p = 0; p < 2; p++) {
++		const uint32_t v = vig[p];
++		fbflip_wr(v + FBSCALE_QSEED3 + 0x04, sweet_fbscale.save_op[p]);
++		fbflip_wr(v + FBSCALE_SRC_SIZE, sweet_fbscale.save_size[p]);
++		fbflip_wr(v + FBSCALE_SRC_XY, sweet_fbscale.save_xy[p]);
++		fbflip_wr(v + FBFLIP_YSTRIDE0, sweet_fbscale.save_stride[p]);
++		for (unsigned c = 0; c < 3; c++) {
++			fbflip_wr(v + FBSCALE_REQ_C0 + 0x10 * c, sweet_fbscale.save_req[p][c]);
++		}
++		fbflip_wr(v + FBFLIP_SRC0_ADDR, (uint32_t)sweet_fbflip.pa[0]);
++	}
++	fbflip_wr(FBFLIP_CTL0_FLUSH, FBFLIP_FLUSH_BITS);
++	sweet_fbscale.on = sweet_fbscale.programmed = false;
++	sweet_fbflip.front = 0;
++}
++
+ static void
+ fbflip_program(unsigned b)
+ {
++	if (sweet_fbscale.on && !sweet_fbscale.programmed) {
++		fbscale_program_pipes();        /* flushed together with the first logical frame's address below */
++	}
+ 	fbflip_wr(FBFLIP_VIG0 + FBFLIP_SRC0_ADDR, (uint32_t)sweet_fbflip.pa[b]);
+ 	fbflip_wr(FBFLIP_VIG1 + FBFLIP_SRC0_ADDR, (uint32_t)sweet_fbflip.pa[b]);
+ 	fbflip_wr(FBFLIP_CTL0_FLUSH, FBFLIP_FLUSH_BITS);
+@@ -848,7 +933,8 @@
+ 	}
+ }
+ 
+-static void fbflip_setup(uint64_t panel_pa, uint32_t row_bytes, uint64_t panel_bytes, uintptr_t panel_cpu);
++static void fbflip_setup(uint64_t panel_pa, uint32_t row_bytes, uint64_t panel_bytes, uintptr_t panel_cpu, uint32_t panel_w,
++    uint32_t panel_h, uint32_t logical_w, uint32_t logical_h);
+ 
+ static void
+ sweet_fb_scanout_sample(AppleCLCD *fb, uint64_t tick)
+@@ -1138,11 +1224,21 @@
+ 					sweet_fbflip.cpu_flip++;
+ 					flipped = true;
+ 				}
+-				if (!flipped) {
++				if (!flipped && !sweet_fbscale.on) {
+ 					fbflip_for_cpu();       /* the CPU writes buffer 0: show buffer 0 */
+ 				}
+ 				IOLockUnlock(fb->fPresentLock);
+ 			}
++			if (!flipped && sweet_fbscale.on) {
++				/* the pipes scale logical frames: a panel-sized CPU frame cannot be shown; try again next vsync */
++				sweet_fb_stats.busy++;
++				IOLockLock(fb->fLock);
++				fb->fDirty = true;
++				IOLockUnlock(fb->fLock);
++				IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++				sender->setTimeoutUS(sweet_fb_next_tick_us());
++				return;
++			}
+ 			if (!flipped && !fb->presentComposed(rec)) {        /* 0170 */
+ 				fb->present(rec);
+ 			}
+@@ -1546,7 +1642,8 @@
+ }
+ 
+ static void
+-fbflip_setup(uint64_t panel_pa, uint32_t row_bytes, uint64_t panel_bytes, uintptr_t panel_cpu)
++fbflip_setup(uint64_t panel_pa, uint32_t row_bytes, uint64_t panel_bytes, uintptr_t panel_cpu, uint32_t panel_w,
++    uint32_t panel_h, uint32_t logical_w, uint32_t logical_h)
+ {
+ 	if (sweet_fbflip.tried) {
+ 		return;
+@@ -1597,6 +1694,45 @@
+ 	sweet_fbflip.ok = true;
+ 	IOLog("SWEET FB: page flip on: buffers %#llx and %#llx (%llu KB), pipes VIG0/VIG1, CTL0 flush %#x\n",
+ 	    panel_pa, second, panel_bytes >> 10, FBFLIP_FLUSH_BITS);
++
++	/* hardware scaling (fbscale_program_pipes): only on the layout scanprobe saw */
++	uint32_t hw = 1;
++	(void)PE_parse_boot_argn("sweetfbhwscale", &hw, sizeof(hw));
++	const uint32_t half = logical_w / 2, outw = panel_w / 2, pitch = (logical_w * 4 + 63) & ~63u;
++	const uint32_t ver0 = fbflip_rd(FBFLIP_VIG0 + FBSCALE_QSEED3), ver1 = fbflip_rd(FBFLIP_VIG1 + FBSCALE_QSEED3);
++	const uint32_t panel_half = (panel_h << 16) | outw;
++	if (!hw || (logical_w & 1) || (panel_w & 1) || logical_w >= panel_w || logical_h >= panel_h ||
++	    (uint64_t)pitch * logical_h > FBFLIP_SECOND || ver0 != ver1 || (ver0 >> 12) != 1 || ver0 == 0x1002 ||
++	    fbflip_rd(FBFLIP_VIG0 + FBSCALE_SRC_SIZE) != panel_half || fbflip_rd(FBFLIP_VIG1 + FBSCALE_SRC_SIZE) != panel_half ||
++	    fbflip_rd(FBFLIP_VIG0 + FBSCALE_SRC_XY) != 0 || fbflip_rd(FBFLIP_VIG1 + FBSCALE_SRC_XY) != outw ||
++	    fbflip_rd(FBFLIP_VIG0 + FBSCALE_OUT_SIZE) != panel_half || fbflip_rd(FBFLIP_VIG1 + FBSCALE_OUT_SIZE) != panel_half ||
++	    (fbflip_rd(FBFLIP_VIG0 + FBSCALE_QSEED3 + 0x04) & 1) || (fbflip_rd(FBFLIP_VIG1 + FBSCALE_QSEED3 + 0x04) & 1)) {
++		IOLog("SWEET FB: hardware scaling off (sweetfbhwscale=%u, QSEED3 %08x %08x, logical %ux%u, panel %ux%u): GPU scaling\n",
++		    hw, ver0, ver1, logical_w, logical_h, panel_w, panel_h);
++		return;
++	}
++	static const uint32_t vig[2] = { FBFLIP_VIG0, FBFLIP_VIG1 };
++	for (unsigned p = 0; p < 2; p++) {
++		sweet_fbscale.save_size[p] = fbflip_rd(vig[p] + FBSCALE_SRC_SIZE);
++		sweet_fbscale.save_xy[p] = fbflip_rd(vig[p] + FBSCALE_SRC_XY);
++		sweet_fbscale.save_stride[p] = fbflip_rd(vig[p] + FBFLIP_YSTRIDE0);
++		sweet_fbscale.save_op[p] = fbflip_rd(vig[p] + FBSCALE_QSEED3 + 0x04);
++		for (unsigned c = 0; c < 3; c++) {
++			sweet_fbscale.save_req[p][c] = fbflip_rd(vig[p] + FBSCALE_REQ_C0 + 0x10 * c);
++		}
++	}
++	sweet_fbscale.lw = logical_w;
++	sweet_fbscale.lh = logical_h;
++	sweet_fbscale.half = half;
++	sweet_fbscale.pitch = pitch;
++	sweet_fbscale.outw = outw;
++	sweet_fbscale.outh = panel_h;
++	sweet_fbscale.version = ver0;
++	sweet_console_panic_hook = fbscale_panic_restore;
++	__asm__ volatile ("dmb sy" ::: "memory");
++	sweet_fbscale.on = true;
++	IOLog("SWEET FB: hardware scaling on: %ux%u frames (pitch %u) scaled by the VIG pipes' QSEED3 (v%04x) to 2 x %ux%u\n",
++	    logical_w, logical_h, pitch, ver0, outw, panel_h);
+ }
+ 
+ /*
+@@ -1830,12 +1966,14 @@
+ 	if (x1 <= x0 || y1 <= y0) {
+ 		return false;
+ 	}
+-	o->px0 = (uint32_t)(((uint64_t)x0 * fb->fWidth + fb->fLogicalW - 1) / fb->fLogicalW);
+-	o->px1 = (uint32_t)(((uint64_t)x1 * fb->fWidth + fb->fLogicalW - 1) / fb->fLogicalW);
+-	o->py0 = (uint32_t)(((uint64_t)y0 * fb->fHeight + fb->fLogicalH - 1) / fb->fLogicalH);
+-	o->py1 = (uint32_t)(((uint64_t)y1 * fb->fHeight + fb->fLogicalH - 1) / fb->fLogicalH);
+-	o->px1 = o->px1 > fb->fWidth ? fb->fWidth : o->px1;
+-	o->py1 = o->py1 > fb->fHeight ? fb->fHeight : o->py1;
++	/* hardware scaling: the buffers are logical-sized, so the blit is 1:1 */
++	const uint32_t tw = sweet_fbscale.on ? fb->fLogicalW : fb->fWidth, th = sweet_fbscale.on ? fb->fLogicalH : fb->fHeight;
++	o->px0 = (uint32_t)(((uint64_t)x0 * tw + fb->fLogicalW - 1) / fb->fLogicalW);
++	o->px1 = (uint32_t)(((uint64_t)x1 * tw + fb->fLogicalW - 1) / fb->fLogicalW);
++	o->py0 = (uint32_t)(((uint64_t)y0 * th + fb->fLogicalH - 1) / fb->fLogicalH);
++	o->py1 = (uint32_t)(((uint64_t)y1 * th + fb->fLogicalH - 1) / fb->fLogicalH);
++	o->px1 = o->px1 > tw ? tw : o->px1;
++	o->py1 = o->py1 > th ? th : o->py1;
+ 	if (o->px1 <= o->px0 || o->py1 <= o->py0) {
+ 		return false;
+ 	}
+@@ -2006,7 +2144,7 @@
+ 		sweet_fb_stats.gpu_skip[0]++;           /* 0169: why a Metal frame took the CPU path */
+ 		return 0;
+ 	}
+-	fbflip_setup(fPhys, fRowBytes, (uint64_t)fRowBytes * fHeight, fPixels);
++	fbflip_setup(fPhys, fRowBytes, (uint64_t)fRowBytes * fHeight, fPixels, fWidth, fHeight, fLogicalW, fLogicalH);
+ 	/*
+ 	 * 2026-11-17 (async flip): the previous frame not on the panel yet no longer blocks the swap (up to 20 ms of
+ 	 * CoreAnimation's render thread, mostly waiting for the panel's next frame start, while the GPU sat idle: 55-63%
+@@ -2299,7 +2437,7 @@
+ 		dw[n++] = 0x430;
+ 		dw[n++] = (uint32_t)dst;
+ 		dw[n++] = (uint32_t)(dst >> 32);
+-		dw[n++] = fRowBytes >> 6;
++		dw[n++] = (sweet_fbscale.on ? sweet_fbscale.pitch : fRowBytes) >> 6;
+ 		dw[n++] = fbgpu_pkt4(0x8c20, 3);        /* RB_A2D_DEST_FLAG_BUFFER_BASE, _PITCH */
+ 		dw[n++] = (uint32_t)dst;
+ 		dw[n++] = (uint32_t)(dst >> 32);
+@@ -2645,6 +2783,18 @@
+ 			(void)sweet_gpu_wait_fence_ns(sweet_fbgpu.fence[k], 50000000ull);
+ 		}
+ 	}
++	if (sweet_fbscale.on) {
++		/* hardware scaling: the hidden buffer takes the logical frame as it is; the pipes scale it */
++		if (dst == 0) {
++			return false;
++		}
++		for (uint32_t ly = 0; ly < fLogicalH; ly++) {
++			memcpy((void *)(dst + (uint64_t)ly * sweet_fbscale.pitch), fCompose + (uint64_t)ly * fLogicalW, (size_t)fLogicalW * 4);
++		}
++		sweet_fb_stats.composed++;
++		sweet_fb_stats.comp_time += mach_absolute_time() - began;
++		return true;
++	}
+ 	for (uint32_t py = 0; py < fHeight; py++) {
+ 		uint32_t ly = (uint32_t)(((uint64_t)py * fLogicalH) / fHeight);
+ 		const uint32_t *srow = fCompose + (uint64_t)ly * fLogicalW;
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -283,6 +283,11 @@
+  * the GUI. A panic draws again.
+  */
+ int sweet_console_muted;
++/*
++ * Set by AppleCLCD while the display pipes scale (2026-11-17 hardware scaling): called once at the first console output
++ * of a panic, to put the pipes back on the 1:1 buffer the console draws into. Register writes only.
++ */
++void (*sweet_console_panic_hook)(void);
+ #endif
+ 
+ static inline void
+@@ -292,6 +297,11 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
++	if (sweet_console_panic_hook != NULL && panic_active()) {
++		void (*hook)(void) = sweet_console_panic_hook;
++		sweet_console_panic_hook = NULL;
++		hook();
++	}
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}

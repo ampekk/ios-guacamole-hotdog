@@ -1,0 +1,57 @@
+--- ../../research/ios27.2/kernel-backup/IOKitBSDInit.cpp.before-disk0	2026-11-15 01:51:00.940429103 +0000
++++ iokit/bsddev/IOKitBSDInit.cpp	2026-11-15 01:51:00.957214947 +0000
+@@ -808,6 +808,38 @@
+ 		}
+ 		strlcpy(rootName, rdBootVar, rootNameSize);
+ 		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		/*
++		 * MobileGestalt's NANDSize() (TotalDiskCapacity: Settings > About > Capacity, iPhone Storage) is
++		 * IOServiceGetMatchingService(IOBSDNameMatching("disk0")) + its "Size" (kIOMediaSizeKey) as SInt64;
++		 * without it Capacity reads 0 KB and iPhone Storage "-9 GB of 0 KB". There is no IOMedia here (the
++		 * root is the ufsroot0 BSD device): publish a plain nub with those properties, sized as the root
++		 * partition so that capacity - available = what the root uses. Boot-arg sweetdisk0=0 leaves it out.
++		 */
++		{
++			extern uint64_t sweet_ufs_size_bytes(void);
++			uint32_t disk0 = 1;
++			PE_parse_boot_argn("sweetdisk0", &disk0, sizeof(disk0));
++			uint64_t bytes = sweet_ufs_size_bytes();
++			IOService *nub = disk0 && bytes ? new IOService : NULL;
++			if (nub != NULL && nub->init()) {
++				nub->setName("SweetUFSMedia");
++				nub->setProperty("BSD Name", "disk0");
++				nub->setProperty("BSD Major", major(*root), 32);
++				nub->setProperty("BSD Minor", minor(*root), 32);
++				nub->setProperty("Size", bytes, 64);
++				nub->setProperty("Preferred Block Size", 4096ULL, 64);
++				nub->setProperty("Whole", true);
++				nub->setProperty("Writable", true);
++				nub->setProperty("Content", "GUID_partition_scheme");
++				if (nub->attach(IOService::getServiceRoot())) {
++					nub->registerService();
++					IOLog("SWEET UFS: disk0 nub published, Size %llu bytes\n", bytes);
++				}
++				nub->release();
++			} else if (nub != NULL) {
++				nub->release();
++			}
++		}
+ 		*oflags = 0;
+ 		goto iofrootx;
+ 	}
+--- ../../research/ios27.2/kernel-backup/sweet_ufs.c.before-disk0	2026-11-15 01:51:00.943421396 +0000
++++ bsd/dev/sweet_ufs.c	2026-11-15 01:51:00.954086028 +0000
+@@ -940,4 +940,13 @@
+ 	*dev = su.bdev;
+ 	return 0;
+ }
++
++/* Size of the root partition in bytes (0 before sweet_ufs_init), for the "disk0" nub in IOKitBSDInit.cpp. */
++uint64_t sweet_ufs_size_bytes(void);
++
++uint64_t
++sweet_ufs_size_bytes(void)
++{
++	return su.ready ? su.nblocks * UFS_BLOCK : 0;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

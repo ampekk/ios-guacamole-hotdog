@@ -1,0 +1,313 @@
+--- a/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
++++ b/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+@@ -574,7 +574,7 @@
+ #define GLOG(...) do{if(logGpuOn()){NSString *glogText=[NSString stringWithFormat:__VA_ARGS__];\
+  os_log(OS_LOG_DEFAULT,"%{public}s",glogText.UTF8String?:"?");}}while(0)
+ #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];GLOG(@"%@",nbText);noteProblem(nbText);\
+- if(logToStderr())fprintf(stderr,"%s: %.140s\n",getprogname(),nbText.UTF8String?:"?");}while(0)
++ if(logToStderr())fprintf(stderr,"%s: %.600s\n",getprogname(),nbText.UTF8String?:"?");}while(0)
+ // The render server does not get past the loss of its GPU context: CoreAnimation keeps submitting to the dead context and
+ // the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
+ // and the context's loss mask, not here). End it once its completed handlers have seen the error; launchd starts it
+@@ -642,6 +642,12 @@
+ }
+ static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
+  gSurfaceRefusals++;
++ if(surface && d && d.width!=d.height && d.width==IOSurfaceGetHeight(surface) && d.height==IOSurfaceGetWidth(surface)){
++  static std::atomic<uint32_t> said{0};   // a landscape view of a portrait surface refused (rotatedSurfaceTexture did not take it)
++  if(said.fetch_add(1)<8)os_log(OS_LOG_DEFAULT,"native-metal: rotated framebuffer: refused at step %u: surface %#x %zux%zu planes %zu plane %lu as %lux%lu rows %llu",
++   step,IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetPlaneCount(surface),(unsigned long)plane,
++   (unsigned long)d.width,(unsigned long)d.height,(unsigned long long)row);
++ }
+  SurfaceRefusal r={step,surface?IOSurfaceGetPixelFormat(surface):0,surface?(uint32_t)IOSurfaceGetPlaneCount(surface):0,(uint32_t)plane,
+                    d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0,
+                    surface?IOSurfaceGetWidth(surface):0,surface?IOSurfaceGetHeight(surface):0,textureRotation(d),textureFlag(d,"framebufferOnly")};
+@@ -1596,6 +1602,21 @@
+ @implementation NBFunctionConstant
+ - (BOOL)isRequired {return _required;}
+ @end
++// 2026-11-19: MTLVertexAttribute / MTLAttribute as vertexAttributes and stageInputAttributes answer them (MTLVertexAttribute's
++// getters: isActive, isPatchData, isPatchControlPointData; -active and friends too).
++@interface NBAttribute : NSObject
++@property(nonatomic,copy) NSString *name;
++@property(nonatomic) NSUInteger attributeIndex;
++@property(nonatomic) MTLDataType attributeType;
++@property(nonatomic) BOOL active,patchData,patchControlPointData;
++@end
++@implementation NBAttribute
++- (BOOL)isActive {return _active;}
++- (BOOL)isPatchData {return _patchData;}
++- (BOOL)isPatchControlPointData {return _patchControlPointData;}
++- (NSString *)description {return [NSString stringWithFormat:@"<NBAttribute %@ [[attribute(%lu)]] type %lu%@>",_name,(unsigned long)_attributeIndex,
++                                    (unsigned long)_attributeType,_active?@"":@" inactive"];}
++@end
+ @implementation NBFunction
+ - (NSDictionary<NSString *,MTLFunctionConstant *> *)functionConstantsDictionary {
+  NSMutableDictionary *result=[NSMutableDictionary dictionary];
+@@ -1609,6 +1630,21 @@
+  }
+  return result;
+ }
++// 2026-11-19: bgfx (Minecraft) builds its vertex descriptors from vertexAttributes; unanswered (nil), every one was empty.
++static NSArray *functionAttributes(NmbFunction *handle,bool stageInput) {
++ if(!handle)return nil;
++ const int32_t n=nmb_function_attribute_count(handle,stageInput);if(n<0)return nil;
++ NSMutableArray *out=[NSMutableArray arrayWithCapacity:(NSUInteger)n];
++ for(int32_t i=0;i<n;i++) {
++  char name[256]={};uint64_t index=0,type=0;uint32_t flags=0;
++  if(!nmb_function_attribute_at(handle,stageInput,(uint32_t)i,name,sizeof name,&index,&type,&flags))return nil;
++  NBAttribute *a=[NBAttribute new];a.name=@(name);a.attributeIndex=(NSUInteger)index;a.attributeType=(MTLDataType)type;
++  a.active=(flags&1)!=0;a.patchData=(flags&2)!=0;a.patchControlPointData=(flags&4)!=0;[out addObject:a];
++ }
++ return out;
++}
++- (NSArray *)vertexAttributes {return functionAttributes(_handle,false);}
++- (NSArray *)stageInputAttributes {return functionAttributes(_handle,true);}
+ - (void)dealloc {DetailSpan timing(8,(uintptr_t)_handle);if(_handle)nmb_function_release(_handle);}
+ // _MTLFunction's bitCodeHash (32 bytes), read by the stitched-library path (createStitchingScriptHash): a digest naming this function
+ // object, its name and a serial no other function in the process has.
+@@ -2028,6 +2064,7 @@
+  }
+  if(manifest)fclose(manifest);
+ }
++static NBTexture *rotationShadowOf(id t);   // rotatedSurfaceTexture's landscape stand-ins (below)
+ @interface NBCommandBuffer : NBObject {
+ @public
+  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
+@@ -2046,6 +2083,7 @@
+ @property(nonatomic) uint32_t commitIndex;
+ @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
+ @property(nonatomic,strong) NSMutableSet *surfaces;
++@property(nonatomic,strong) NSMutableSet *rotatedShadows;   // landscape stand-ins drawn into (rotatedSurfaceTexture), turned into their surfaces at commit
+ // Runtime handles retain GPU storage, but only the Objective-C owner retains
+ // a no-copy deallocator, its memory owner and texture/heap ancestry.
+ @property(nonatomic,strong) NSMutableSet *resourceOwners;
+@@ -2506,6 +2544,7 @@
+  if(texture){[_commandBuffer own:texture];}
+  [self dumpBind:texture index:index stage:stage+4];
+  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
++ if(texture && (texture.usage&MTLTextureUsageShaderWrite))if(NBTexture *shadow=rotationShadowOf(texture))[_commandBuffer.rotatedShadows addObject:shadow];
+  if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
+  ENCODE([self check:nmb_encoder_set_texture(self->_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"]);
+ }
+@@ -2895,6 +2934,7 @@
+   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
+   [self.commandBuffer own:o];
+   if([(NBTexture *)o surface])[self.commandBuffer.surfaces addObject:o];
++  if(NBTexture *shadow=rotationShadowOf(o))[self.commandBuffer.rotatedShadows addObject:shadow];   // a blit into (or from) a landscape stand-in
+  }
+  return true;
+ }
+@@ -3140,6 +3180,122 @@
+  [(id<MTLCommandBuffer>)readback commit];
+ }
+ 
++// 2026-11-19 (ios-sweet, port of the iOS 16 frontend's 0196): CoreAnimation's framebuffer while a landscape app is in front.
++// backboardd asks for its portrait framebuffer surfaces (828x1792) as 1792x828 textures (a private rotation on the descriptor):
++// Apple's driver gives a texture whose texels land rotated in the surface. The runtime cannot (the surface's rows are too short), so
++// QuartzCore logged "Failed to allocate [1792 x 828] BGRA framebuffer" every frame and the screen stayed black (Minecraft). Instead it
++// gets a landscape texture of our own (the "shadow", which keeps what CA drew, so loads and partial redraws work); every command
++// buffer that rendered into it ends with one full-screen pass that turns it into the surface (a portrait texture over the surface).
++// Direction: from the descriptor's rotation (3: clockwise, else counter-clockwise); `touch /var/local/sweet-rotate-flip` turns
++// both the other way, `touch /var/local/sweet-norotate` refuses as before. Read when a shadow is made (after a respring).
++// Always in the system log (not only with SHENG_LOG_GPU): the first 40 lines, so a landscape test shows which step failed.
++static std::atomic<uint32_t> gRotationLogs{0};
++#define RLOG(...) do{if(gRotationLogs.fetch_add(1)<40){NSString *rlogText=[NSString stringWithFormat:__VA_ARGS__];\
++ os_log(OS_LOG_DEFAULT,"%{public}s",rlogText.UTF8String?:"?");}}while(0)
++static NSString *const kRotationSource=@"#include <metal_stdlib>\n"
++ "using namespace metal;\n"
++ "struct RotV { float4 position [[position]]; };\n"
++ "vertex RotV rot_v(uint vid [[vertex_id]]) {\n"
++ " float2 p=float2(float((vid<<1)&2),float(vid&2)); RotV o; o.position=float4(p*2.0-1.0,0.0,1.0); return o;\n"
++ "}\n"
++ // portrait pixel p (width W = the landscape height, height H = the landscape width)
++ "fragment float4 rot_cw(RotV in [[stage_in]], texture2d<float, access::read> src [[texture(0)]]) {\n"
++ " uint2 p=uint2(in.position.xy); uint W=src.get_height(); return src.read(uint2(p.y, W-1-min(p.x,W-1)));\n"
++ "}\n"
++ "fragment float4 rot_ccw(RotV in [[stage_in]], texture2d<float, access::read> src [[texture(0)]]) {\n"
++ " uint2 p=uint2(in.position.xy); uint H=src.get_width(); return src.read(uint2(H-1-min(p.y,H-1), p.x));\n"
++ "}\n"
++ // test: the same with a red tint (/var/local/sweet-rotate-tint), to see whether the turn's output reaches the display
++ "fragment float4 rot_cw_t(RotV in [[stage_in]], texture2d<float, access::read> src [[texture(0)]]) {\n"
++ " uint2 p=uint2(in.position.xy); uint W=src.get_height(); return src.read(uint2(p.y, W-1-min(p.x,W-1)))*0.6+float4(0.4,0.0,0.0,0.4);\n"
++ "}\n"
++ "fragment float4 rot_ccw_t(RotV in [[stage_in]], texture2d<float, access::read> src [[texture(0)]]) {\n"
++ " uint2 p=uint2(in.position.xy); uint H=src.get_width(); return src.read(uint2(H-1-min(p.y,H-1), p.x))*0.6+float4(0.4,0.0,0.0,0.4);\n"
++ "}\n";
++static std::atomic<uint64_t> gRotations{0};
++static id<MTLRenderPipelineState> rotationPipeline(MTLPixelFormat format,unsigned mode) {
++ static std::mutex lock;static NSMutableDictionary *pipelines;static id<MTLLibrary> library;static bool failed;
++ std::lock_guard<std::mutex> guard(lock);
++ if(!pipelines)pipelines=[NSMutableDictionary dictionary];
++ NSNumber *key=@((uint64_t)format*4+mode);   // mode: bit 0 counter-clockwise, bit 1 tinted (test)
++ if(id state=pipelines[key])return state;
++ if(failed)return nil;
++ NSError *error=nil;
++ if(!library){
++  library=[(id<MTLDevice>)gDeviceObject newLibraryWithSource:kRotationSource options:nil error:&error];
++  if(!library){failed=true;RLOG(@"native-metal: rotated framebuffer: the turning shader does not compile: %@",error);return nil;}
++ }
++ MTLRenderPipelineDescriptor *d=[MTLRenderPipelineDescriptor new];
++ d.label=@"sweet rotated framebuffer";
++ d.vertexFunction=[library newFunctionWithName:@"rot_v"];
++ static NSString *const names[4]={@"rot_cw",@"rot_ccw",@"rot_cw_t",@"rot_ccw_t"};
++ d.fragmentFunction=[library newFunctionWithName:names[mode&3]];
++ d.colorAttachments[0].pixelFormat=format;
++ id<MTLRenderPipelineState> state=d.vertexFunction && d.fragmentFunction?
++  [(id<MTLDevice>)gDeviceObject newRenderPipelineStateWithDescriptor:d error:&error]:nil;
++ if(!state){RLOG(@"native-metal: rotated framebuffer: no pipeline for format %lu: %@",(unsigned long)format,error);return nil;}
++ pipelines[key]=state;
++ return state;
++}
++// The shadow a texture is, or is a view of (nil: none).
++static NBTexture *rotationShadowOf(id t) {
++ for(int depth=0;t && depth<4;depth++){
++  if(![t isKindOfClass:[NBTexture class]])return nil;
++  if(objc_getAssociatedObject(t,"rotPortrait"))return (NBTexture *)t;
++  t=[(NBTexture *)t parent];
++ }
++ return nil;
++}
++static id<MTLTexture> rotatedSurfaceTexture(id device,MTLTextureDescriptor *d,IOSurfaceRef surface) {
++ const uint64_t spi=textureRotation(d);
++ static std::atomic<uint32_t> asked{0};
++ if(asked.fetch_add(1)<4)RLOG(@"native-metal: rotated framebuffer: asked: surface %#x %zux%zu as %lux%lu fmt %lu usage %lu storage %lu rotation %llu",IOSurfaceGetID(surface),
++  IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,
++  (unsigned long)d.usage,(unsigned long)d.storageMode,(unsigned long long)spi);
++ if(access("/var/local/sweet-norotate",F_OK)==0){RLOG(@"native-metal: rotated framebuffer: off (/var/local/sweet-norotate)");return nil;}
++ // Only a view that is drawn into. A sampled one (backboardd reading an app's rotated drawable, usage ShaderRead) would get an
++ // empty shadow: nothing turns the surface's pixels into it, so the app's layer was black (Minecraft, test 5). Refused, CA
++ // turns the surface through the scaler instead (copy_iosurface, SweetM2Scaler in the kernel), as before this change.
++ if(!(d.usage&MTLTextureUsageRenderTarget)){
++  static std::atomic<uint32_t> readOnly{0};
++  if(readOnly.fetch_add(1)<4)RLOG(@"native-metal: rotated framebuffer: sampled-only view of surface %#x refused (usage %lu): left to the scaler",IOSurfaceGetID(surface),(unsigned long)d.usage);
++  return nil;
++ }
++ const unsigned mode=((spi==3?0u:1u)^(access("/var/local/sweet-rotate-flip",F_OK)==0?1u:0u))|(access("/var/local/sweet-rotate-tint",F_OK)==0?2u:0u);   // bit 0 counter-clockwise, bit 1 tinted
++ static std::mutex lock;static NSMutableDictionary *shadows;static std::atomic<uint32_t> said{0};
++ std::lock_guard<std::mutex> guard(lock);
++ if(!shadows)shadows=[NSMutableDictionary dictionary];
++ NSString *key=[NSString stringWithFormat:@"%u:%lu:%lux%lu",IOSurfaceGetID(surface),(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height];
++ if(NBTexture *shadow=shadows[key]){
++  NBTexture *portrait=objc_getAssociatedObject(shadow,"rotPortrait");
++  if(portrait && IOSurfaceGetBaseAddress(portrait.surface)==IOSurfaceGetBaseAddress(surface) &&
++     [objc_getAssociatedObject(shadow,"rotMode") unsignedIntValue]==mode)return (id<MTLTexture>)(id)shadow;
++  [shadows removeObjectForKey:key];
++ }
++ if(!rotationPipeline(d.pixelFormat,mode)){RLOG(@"native-metal: rotated framebuffer: no turning pipeline");return nil;}
++ MTLTextureDescriptor *pd=[d copy];pd.width=d.height;pd.height=d.width;pd.usage=d.usage|MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
++ if([pd respondsToSelector:sel_registerName("setRotation:")])((void (*)(id,SEL,NSUInteger))objc_msgSend)(pd,sel_registerName("setRotation:"),0);
++ id<MTLTexture> portrait=[(id<MTLDevice>)device newTextureWithDescriptor:pd iosurface:surface plane:0];
++ if(![(id)portrait isKindOfClass:[NBTexture class]]){RLOG(@"native-metal: rotated framebuffer: surface %#x refused even the right way up",IOSurfaceGetID(surface));return nil;}
++ // A plain descriptor, not a copy of CA's: that one is framebufferOnly (and rotated), which the runtime refuses for a texture of its
++ // own (test 2: "no 1792x828 texture of our own" every frame).
++ MTLTextureDescriptor *sd=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:d.pixelFormat width:d.width height:d.height mipmapped:NO];
++ sd.storageMode=MTLStorageModePrivate;sd.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
++ id<MTLTexture> made=[(id<MTLDevice>)device newTextureWithDescriptor:sd];
++ if(![(id)made isKindOfClass:[NBTexture class]]){RLOG(@"native-metal: rotated framebuffer: no %lux%lu texture of our own: %@",(unsigned long)d.width,(unsigned long)d.height,lastError());return nil;}
++ NBTexture *shadow=(NBTexture *)made;
++ shadow.surface=(IOSurfaceRef)CFRetain(surface);    // what CA asked for: -iosurface answers it
++ objc_setAssociatedObject(shadow,"rotPortrait",portrait,OBJC_ASSOCIATION_RETAIN);
++ objc_setAssociatedObject(shadow,"rotMode",@(mode),OBJC_ASSOCIATION_RETAIN);
++ if(shadows.count>=8)[shadows removeAllObjects];
++ shadows[key]=shadow;
++ if(said.fetch_add(1)<16)
++  RLOG(@"native-metal: rotated framebuffer: surface %#x %zux%zu asked as %lux%lu fmt %lu usage %lu: a landscape texture of ours, turned %s into the surface (descriptor rotation %llu)",
++   IOSurfaceGetID(surface),IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),(unsigned long)d.width,(unsigned long)d.height,
++   (unsigned long)d.pixelFormat,(unsigned long)d.usage,(mode&1)?((mode&2)?"counter-clockwise, tinted":"counter-clockwise"):((mode&2)?"clockwise, tinted":"clockwise"),(unsigned long long)spi);
++ return (id<MTLTexture>)(id)shadow;
++}
++
+ // Retain the surface's colour-space description and serialized-property hash with each sample.
+ @implementation NBCommandBuffer
+ // IOGPUMetalCommandBuffer's userDictionary: a mutable dictionary per command buffer, which MPS keeps its per-buffer state in (nil lost it).
+@@ -3154,7 +3310,7 @@
+ // iPadOS 27: QuartzCore names the tasks a command buffer works for (GPU time attribution), on every buffer; there is no such accounting here.
+ - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
+ - (instancetype)init {
+- if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
++ if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_rotatedShadows=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
+  if(self){traceNumber=++gFrameNumber;createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();if(earlyEligible){pthread_t none=nullptr;gEncodeReference.compare_exchange_strong(none,pthread_self());traceThread(1);}frontStage(traceNumber,0,1);}
+  return self;
+ }
+@@ -3299,6 +3455,7 @@
+   if(!a.texture)return true;
+   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
+   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
++  if(NBTexture *shadow=rotationShadowOf(texture))[_rotatedShadows addObject:shadow];
+   [self own:texture];
+   const size_t copiesBefore=resolveCopies.size();
+   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+@@ -3306,6 +3463,7 @@
+    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
+    NBTexture *resolve=(NBTexture *)a.resolveTexture;
+    [self own:resolve];if(resolve.surface)[_surfaces addObject:resolve];
++   if(NBTexture *shadow=rotationShadowOf(resolve))[_rotatedShadows addObject:shadow];
+    const bool resolves=a.storeAction==MTLStoreActionMultisampleResolve || a.storeAction==MTLStoreActionStoreAndMultisampleResolve;
+    if(singleSample()) {
+     if(resolves) {
+@@ -3386,8 +3544,15 @@
+ - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
+ - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
+ // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
+-- (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
+-- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
++// A drawable whose texture is a landscape stand-in is turned into its surface by the command buffer that presents it, after all the
++// buffer's work (Minecraft: the frame reached the stand-in some other way than as a render target, and the turn copied black).
++static void turnPresented(NBCommandBuffer *buffer,id drawable) {
++ SEL sel=sel_registerName("texture");
++ if(![drawable respondsToSelector:sel])return;
++ if(NBTexture *shadow=rotationShadowOf(((id (*)(id,SEL))objc_msgSend)(drawable,sel)))[buffer.rotatedShadows addObject:shadow];
++}
++- (void)presentDrawable:(id<MTLDrawable>)drawable {turnPresented(self,drawable);[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
++- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {turnPresented(self,drawable);[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
+ - (void)enqueue {}
+ - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
+  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
+@@ -3485,6 +3650,24 @@
+ }
+ - (void)commit {
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
++ if(_rotatedShadows.count && !self.encodeFailure){   // what CA drew in landscape, into the portrait surface (rotatedSurfaceTexture)
++  NSArray *shadows=[_rotatedShadows allObjects];[_rotatedShadows removeAllObjects];
++  for(NBTexture *shadow in shadows){
++   NBTexture *portrait=objc_getAssociatedObject(shadow,"rotPortrait");
++   id<MTLRenderPipelineState> state=rotationPipeline(shadow.pixelFormat,[objc_getAssociatedObject(shadow,"rotMode") unsignedIntValue]);
++   if(!portrait || !state){RLOG(@"native-metal: rotated framebuffer: nothing to turn with (portrait %p pipeline %p)",portrait,state);continue;}
++   MTLRenderPassDescriptor *rp=[MTLRenderPassDescriptor renderPassDescriptor];
++   rp.colorAttachments[0].texture=(id<MTLTexture>)(id)portrait;rp.colorAttachments[0].loadAction=MTLLoadActionDontCare;rp.colorAttachments[0].storeAction=MTLStoreActionStore;
++   id<MTLRenderCommandEncoder> encoder=[(id<MTLCommandBuffer>)self renderCommandEncoderWithDescriptor:rp];
++   if(!encoder){RLOG(@"native-metal: rotated framebuffer: no encoder for the turn: %@",self.encodeFailure);break;}
++   [encoder setRenderPipelineState:state];
++   [encoder setFragmentTexture:(id<MTLTexture>)(id)shadow atIndex:0];
++   [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
++   [encoder endEncoding];
++   const uint64_t n=++gRotations;
++   if(n<=3 || n%600==0)RLOG(@"native-metal: rotated framebuffer: turn %llu into surface %#x",(unsigned long long)n,IOSurfaceGetID(portrait.surface));
++  }
++ }
+  self.committed=YES;
+  self.committedUs=nowUs();
+  commitCpu=threadCpuUs();commitTid=threadIdLow();
+@@ -4544,6 +4727,9 @@
+  const size_t bytes=(allocation+page-1)&~(page-1);
+  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
++ if(!texture && planes<2 && d.width==IOSurfaceGetHeight(surface) && d.height==IOSurfaceGetWidth(surface) && d.width!=d.height){
++  if(id<MTLTexture> rotated=rotatedSurfaceTexture(self,d,surface))return rotated;   // a landscape view of a portrait surface
++ }
+  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
+  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];return (id<MTLTexture>)texture;
+@@ -4782,8 +4968,9 @@
+  if(!handle) {
+   // The tail of the text (what a client's problem row keeps) names the fragment function, the linked functions given and the compiler's
+   // state: a missing linked function there is RenderBox's stitched custom_blend, which needs the compiler.
+-  NSString *why=[NSString stringWithFormat:@"%@ | frag %@ linked %lu stitched %u/%u compiler %s",lastError(),d.fragmentFunction.name,
+-      (unsigned long)d.fragmentLinkedFunctions.functions.count,gStitchMade.load(),gStitchMade.load()+gStitchFailed.load(),gCompilerLoaded];
++  NSString *why=[NSString stringWithFormat:@"%@ | frag %@ linked %lu stitched %u/%u compiler %s | %@%@",lastError(),d.fragmentFunction.name,
++      (unsigned long)d.fragmentLinkedFunctions.functions.count,gStitchMade.load(),gStitchMade.load()+gStitchFailed.load(),gCompilerLoaded,
++      renderDumpInfo(d),d.vertexDescriptor?@"":@" (no vertex descriptor)"];   // 2026-11-19: the vertex layout (Minecraft: attribute 0 refusals)
+   static std::atomic<int> told{0};
+   if(told.fetch_add(1)<64)NBLOG(@"native-metal: render pipeline refused: %@",why);else noteProblem([@"render pipeline: " stringByAppendingString:why]);
+   if(error)*error=nbError([@"render pipeline: " stringByAppendingString:why]);

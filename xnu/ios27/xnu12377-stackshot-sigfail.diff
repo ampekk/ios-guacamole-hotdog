@@ -1,0 +1,120 @@
+--- a/osfmk/arm/model_dep.c
++++ b/osfmk/arm/model_dep.c
+@@ -1093,6 +1093,11 @@
+  * @result returns KERN_OPERATION_TIMED_OUT if synchronization times out and
+  * proceed_on_sync_failure is false.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern uint32_t sweet_ss_late, sweet_ss_refused, sweet_ss_pending;
++uint32_t sweet_ss_late, sweet_ss_refused, sweet_ss_pending;     /* last given-up stackshot, for kern_stackshot.c */
++#endif
++
+ kern_return_t
+ DebuggerXCallEnter(
+ 	boolean_t proceed_on_sync_failure, bool is_stackshot)
+@@ -1132,6 +1137,9 @@
+ 	 */
+ 	max_cpu = ml_get_max_cpu_number();
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	uint32_t sweet_sigfail = 0;     /* cores cpu_signal refused (SIGPdisabled): never halted */
++#endif
+ 	boolean_t immediate_halt = FALSE;
+ 	if (proceed_on_sync_failure && force_immediate_debug_halt) {
+ 		immediate_halt = TRUE;
+@@ -1150,11 +1158,24 @@
+ 				os_atomic_inc(&debugger_sync, relaxed);
+ 				os_atomic_inc(&debug_cpus_spinning, relaxed);
+ 			} else {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				sweet_sigfail |= 1u << cpu;
++#endif
+ 				kprintf("%s: cpu_signal failed. cpu=%d ret=%d proceed=%d\n", __func__, cpu, ret, proceed_on_sync_failure);
+ 			}
+ 		}
+ 
+ 		max_mabs_time = os_atomic_load(&debug_ack_timeout, relaxed);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * SWEET: debug_ack_timeout came out as 368 ticks (~15 us; panic "Resuming from debugger synchronization
++		 * failed: waited 368 nanoseconds", 2026-11-14) instead of the 240000-tick (10 ms) default, so nearly every
++		 * stackshot found "late" cores. At least the default.
++		 */
++		if (max_mabs_time != 0 && max_mabs_time < 240000) {
++			max_mabs_time = 240000;
++		}
++#endif
+ 
+ 		/*
+ 		 * If the debug_ack_timeout is zero, we will wait for one second, which is more than
+@@ -1188,7 +1209,13 @@
+ 	 * back every SIGPdebug not yet taken, let the cores that did take it go, and report a timeout (the stackshot
+ 	 * syscall fails, the system goes on). Panics still go on as before. The late cores are logged.
+ 	 */
+-	if (!immediate_halt && is_stackshot && current_mabs_time >= max_mabs_time) {
++	/*
++	 * iOS 27.2 (2026-11-14 panic every few minutes): assert(not_in_kdp) again, ReportCrashService in
++	 * mach_vm_region_recurse on core 0 while a stackshot ran, other cores in user code. A core whose cpu_signal is
++	 * refused (SIGPdisabled, e.g. on its way in or out of idle) is not counted in debugger_sync at all, so the sync
++	 * looks complete while it keeps running. For a stackshot that is the same as a late core: give the stackshot up.
++	 */
++	if (!immediate_halt && is_stackshot && (current_mabs_time >= max_mabs_time || sweet_sigfail != 0)) {
+ 		static uint32_t sweet_ss_aborts;
+ 		uint32_t late = 0;
+ 		for (cpu = 0; cpu <= max_cpu; cpu++) {
+@@ -1202,10 +1229,21 @@
+ 				os_atomic_dec(&debug_cpus_spinning, relaxed);
+ 			}
+ 		}
+-		if (late != 0 && sweet_ss_aborts++ < 20) {
+-			printf("SWEET DBG: stackshot sync timed out, cores 0x%x never took SIGPdebug: stackshot given up\n", late);
++		if ((late | sweet_sigfail) != 0 && sweet_ss_aborts++ < 20) {
++			/*
++			 * No printf here: interrupts are off and console I/O from that context panics ("Console I/O from
++			 * interrupt-disabled context", 2026-11-14). kern_stackshot.c prints it once interrupts are back on.
++			 */
++			extern uint32_t sweet_ss_late, sweet_ss_refused, sweet_ss_pending;
++			sweet_ss_late = late;
++			sweet_ss_refused = sweet_sigfail;
++			sweet_ss_pending = 1;
+ 		}
+-		if (late != 0) {
++		if ((late | sweet_sigfail) != 0) {
++			/* the cores that did take it may still be on their way to the spin: wait for them (bounded) */
++			uint64_t until = mach_absolute_time() + 24000000ull;
++			while (os_atomic_load(&debugger_sync, acquire) > 0 && mach_absolute_time() < until) {
++			}
+ 			/* cores that had taken it are spinning on mp_kdp_trap: release them (waits for debug_cpus_spinning) */
+ 			cpu_data_ptr->debugger_active = 1;
+ 			DebuggerXCallReturn();
+@@ -1354,6 +1392,11 @@
+ 	os_atomic_store(&debugger_sync, 0, relaxed);
+ 
+ 	max_mabs_time = os_atomic_load(&debug_ack_timeout, relaxed);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (max_mabs_time != 0 && max_mabs_time < 240000) {
++		max_mabs_time = 240000;         /* as in DebuggerXCallEnter */
++	}
++#endif
+ 
+ 	if (max_mabs_time > 0) {
+ 		current_mabs_time = mach_absolute_time();
+--- a/osfmk/kern/kern_stackshot.c
++++ b/osfmk/kern/kern_stackshot.c
+@@ -2636,6 +2636,16 @@
+ 		/* Emit a SOCD tracepoint that we have completed the stackshot */
+ 		SOCD_TRACE_XNU_END(STACKSHOT);
+ 		ml_set_interrupts_enabled(prev_interrupt_state);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		{
++			extern uint32_t sweet_ss_late, sweet_ss_refused, sweet_ss_pending;
++			if (sweet_ss_pending && prev_interrupt_state) {
++				sweet_ss_pending = 0;
++				printf("SWEET DBG: stackshot: cores 0x%x never took SIGPdebug, 0x%x refused it: stackshot given up\n",
++				    sweet_ss_late, sweet_ss_refused);
++			}
++		}
++#endif
+ 
+ #if CONFIG_EXCLAVES
+ 		/* stackshot trap should only finish successfully or with no pending Exclave threads */

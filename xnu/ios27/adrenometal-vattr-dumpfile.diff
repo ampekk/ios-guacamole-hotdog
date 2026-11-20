@@ -1,0 +1,91 @@
+--- a/UniXNU/drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm
++++ b/UniXNU/drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm
+@@ -346,10 +346,18 @@
+         // standard error (where the dump goes) appended to /private/var/tmp/NativeAdrenoMetal.trace/dump-NAME-PID.log: an app's stderr
+         // goes nowhere. Each dumped command buffer's passes, draws and attachments as brightness grids: does the app draw black itself?
+         {
++            // 2026-11-19 (ios-sweet): or the file /var/local/dump-cb holding NAME:FIRST[:COUNT], so it needs no new boot image (the
++            // boot-arg line is at its length limit).
+             char args[1100] = {};
+             size_t size = sizeof args - 1;
+-            if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+-                if (const char *at = bootArgToken(args, "dump-cb=")) {
++            char fromFile[96] = {};
++            if (FILE *f = fopen("/var/local/dump-cb", "r")) {
++                if (fgets(fromFile + 8, (int)sizeof fromFile - 8, f)) memcpy(fromFile, "dump-cb=", 8);
++                fclose(f);
++                fromFile[strcspn(fromFile, " \r\n")] = 0;
++            }
++            if (fromFile[0] || sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
++                if (const char *at = fromFile[0] ? fromFile : bootArgToken(args, "dump-cb=")) {
+                     char value[96] = {};
+                     strlcpy(value, at + strlen("dump-cb="), sizeof value);
+                     value[strcspn(value, " ")] = 0;
+@@ -358,6 +366,8 @@
+                     if (range && range > value && name && !strncmp(name, value, (size_t)(range - value))) {
+                         *range++ = 0;
+                         setenv("NATIVE_METAL_DUMP_CB", range, 1);
++                        setenv("NMB_LOG_STDERR", "1", 1);   // the driver's own refusal lines into the same file (2026-11-19)
++                        setenv("SHENG_LOG_GPU", "1", 1);    // and its pipeline journal (pipelines-PID.log in the Metal cache directory)
+                         char log[160];
+                         mkdir("/private/var/tmp/NativeAdrenoMetal.trace", 0755);
+                         snprintf(log, sizeof log, "/private/var/tmp/NativeAdrenoMetal.trace/dump-%s-%d.log", name, (int)getpid());
+--- a/UniXNU/drivers/AdrenoMetal/bridge/NativeMetalObjects.rs
++++ b/UniXNU/drivers/AdrenoMetal/bridge/NativeMetalObjects.rs
+@@ -3576,6 +3576,44 @@
+     })
+ }
+ 
++// 2026-11-19 (ios-sweet): MTLFunction's vertexAttributes / stageInputAttributes. bgfx (Minecraft's Renderdragon) builds each
++// pipeline's vertex descriptor from vertexAttributes; unanswered, every descriptor was empty and nothing drew. -1: nil.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_function_attribute_count(function: *const NmbFunction, stage_input: bool) -> i32 {
++    guard(-1, || {
++        let f = &get(function)?.0;
++        let list = (if stage_input { f.stage_input_attributes() } else { f.vertex_attributes() }).map_err(e("function attributes"))?;
++        Ok(list.map_or(-1, |l| l.len() as i32))
++    })
++}
++
++/// Attribute `at`: its name (NUL-terminated in `capacity` bytes), `[[attribute(n)]]`, MTLDataType, and flags (1 active, 2 patch
++/// data, 4 patch control point data).
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_function_attribute_at(function: *const NmbFunction, stage_input: bool, at: u32, name: *mut c_char, capacity: usize,
++                                            index: *mut u64, data_type: *mut u64, flags: *mut u32) -> bool {
++    guard(false, || {
++        let f = &get(function)?.0;
++        let list = (if stage_input { f.stage_input_attributes() } else { f.vertex_attributes() }).map_err(e("function attributes"))?;
++        let list = list.ok_or("no attributes")?;
++        let a = list.get(at as usize).ok_or("no such attribute")?;
++        if name.is_null() || capacity == 0 || index.is_null() || data_type.is_null() || flags.is_null() {
++            return Err("null out".into());
++        }
++        let bytes = a.name().as_bytes();
++        let n = bytes.len().min(capacity - 1);
++        // SAFETY: the caller gives `capacity` bytes at `name` and one word at each other pointer.
++        unsafe {
++            std::ptr::copy_nonoverlapping(bytes.as_ptr(), name as *mut u8, n);
++            *name.add(n) = 0;
++            *index = u64::from(a.attribute_index());
++            *data_type = u64::from(a.attribute_type().as_raw());
++            *flags = u32::from(a.is_active()) | (u32::from(a.is_patch_data()) << 1) | (u32::from(a.is_patch_control_point_data()) << 2);
++        }
++        Ok(true)
++    })
++}
++
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_function_constant_name_size(function: *const NmbFunction, at: u32) -> usize {
+     guard(0, || {
+--- a/UniXNU/drivers/AdrenoMetal/bridge/NativeMetalObjects.h
++++ b/UniXNU/drivers/AdrenoMetal/bridge/NativeMetalObjects.h
+@@ -199,6 +199,9 @@
+ uint32_t nmb_function_constant_count(const NmbFunction *);
+ size_t nmb_function_constant_name_size(const NmbFunction *, uint32_t at);
+ bool nmb_function_constant_at(const NmbFunction *, uint32_t at, char *name, size_t capacity, uint64_t *index, uint64_t *data_type, bool *required);
++int32_t nmb_function_attribute_count(const NmbFunction *, bool stage_input);   // -1: none (nil)
++bool nmb_function_attribute_at(const NmbFunction *, bool stage_input, uint32_t at, char *name, size_t capacity, uint64_t *index,
++                               uint64_t *data_type, uint32_t *flags);   // flags: 1 active, 2 patch data, 4 patch control point data
+ bool nmb_render_set_viewports(NmbEncoder *, const double *values, size_t count);
+ bool nmb_render_set_scissors(NmbEncoder *, const uint64_t *values, size_t count);
+ void nmb_texture_release(NmbTexture *);

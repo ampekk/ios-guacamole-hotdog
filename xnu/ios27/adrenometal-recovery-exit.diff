@@ -1,0 +1,28 @@
+--- research/ios27.2/kernel-backup/NativeMetalObjects.rs.before-recovery-exit	2026-11-15 07:53:09.066864091 +0000
++++ work/UniXNU/drivers/AdrenoMetal/bridge/NativeMetalObjects.rs	2026-11-15 07:53:09.090841495 +0000
+@@ -351,8 +351,25 @@
+     eprintln!("native-metal message {} {:?}: [{}] {}", seen.len(), message.severity, message.id_name, message.text);
+ }
+ 
++// guacamole 2026-11-15: after the runtime recovers from a lost VkDevice (a GPU fault or hang), every texture, pipeline and heap the
++// process made before is refused (NotImplemented(MadeBeforeRecovery)) where Metal's go on; Core Animation never makes them again, so
++// the render server drew nothing and the phone froze (selecting a wallpaper, wp17). End the process instead: launchd starts it again
++// with a fresh device (a respring for backboardd). NATIVE_METAL_RECOVERY_EXIT=0 keeps the process.
++fn end_after_recovery(message: &DebugMessage) {
++    if message.id_name != "metal2vulkan-degrade-device-recovered" {
++        return;
++    }
++    if std::env::var_os("NATIVE_METAL_RECOVERY_EXIT").is_some_and(|v| v == "0") {
++        return;
++    }
++    eprintln!("native-metal: device recovered; ending the process so it starts again on the new device: {}",
++        message.text.chars().take(400).collect::<String>());
++    std::process::abort();
++}
++
+ fn observe_message(message: &DebugMessage) {
+     use std::sync::atomic::Ordering::Relaxed;
++    end_after_recovery(message);
+     if message.id_name == "shadowed-texture" {
+         note_shadow(&message.text);
+     }

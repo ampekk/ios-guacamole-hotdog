@@ -1,0 +1,151 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2269,7 +2269,7 @@
+ static uint32_t sweet_gpu_recoveries;
+ static vm_offset_t sweet_gpu_recover_gmu;
+ 
+-static bool
++static bool __attribute__((unused))
+ be_ring_run(vm_offset_t g, unsigned w, unsigned ms_max)
+ {
+ 	for (unsigned ms = 0; ms < ms_max; ++ms) {
+@@ -2297,6 +2297,51 @@
+ 	return false;
+ }
+ 
++/*
++ * iOS 27.2 (2026-11-14 log): a backboardd job hung; the reset itself went through (GBIF acks 1 1 1, RBBM_STATUS 1,
++ * rptr 0) but CP_ME_INIT never ran: shadow still 0xdeadbeef, CP_INT 0x80 (a6xx CP_INT bit 7: illegal instruction).
++ * be_ring_run gives up at the first nonzero CP_INT read, so a status left over from the reset also ends the try.
++ * Now: the SQE image in gpumem is compared with /sweet-gpu sqe-firmware and restored if it differs, the CP state
++ * after the reset is logged, the ring wait only looks at the shadow, and a failed try is repeated once with the GPU
++ * taken out of secure mode by register (RBBM_SECVID_TRUST_CNTL = 0, msm's path when there is no zap shader).
++ */
++static unsigned
++sweet_gpu_sqe_restore(void)
++{
++	DTEntry node;
++	const void *prop;
++	unsigned int size;
++	if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "sqe-firmware", &prop, &size) != kSuccess ||
++	    size < 8 || size - 4u > 0x10000u) {
++		return 0;
++	}
++	const uint32_t *src = (const uint32_t *)prop + 1;
++	uint32_t *img = (uint32_t *)(gpumem + GPUMEM_SQE);
++	unsigned words = (size - 4u) / 4u, bad = 0;
++	for (unsigned i = 0; i < words; ++i) {
++		bad += img[i] != src[i];
++	}
++	if (bad != 0) {
++		memcpy(img, src, size - 4u);
++		flush_dcache64((addr64_t)(gpumem + GPUMEM_SQE), size - 4u, FALSE);
++	}
++	return bad;
++}
++
++static bool
++be_ring_run_shadow(unsigned w, unsigned ms_max)
++{
++	for (unsigned ms = 0; ms < ms_max; ++ms) {
++		flush_dcache64((addr64_t)(gpumem + GPUMEM_SHADOW), 0x1000u, FALSE);
++		if (*(volatile uint32_t *)(gpumem + GPUMEM_SHADOW) == w) {
++			return true;
++		}
++		delay(1000);
++	}
++	return false;
++}
++
+ /* gpu_be_lock held */
+ static bool
+ sweet_gpu_recover_locked(uint32_t done, uint32_t last)
+@@ -2329,11 +2374,43 @@
+ 	delay(100);
+ 	printf("SWEET GPU: RECOVER #%u: GBIF halt acks %d %d %d; after reset RBBM_STATUS %#x rptr %#x\n",
+ 	    n, h0, h1, h2, grd(g, 0x210), grd(g, 0x806));
++	/*
++	 * The 27.2 hang was an SMMU translation fault on the CP's IB fetch (CB1 FSR 0x402, FAR = IB1 base): the fault
++	 * stays latched in CB1's FSR. Record and clear it and drop the GPU context's TLB before the CP starts again.
++	 */
++	if (be_smmu) {
++		uint32_t fsr = rd(be_smmu, SMMU_CB1 + 0x058);
++		printf("SWEET GPU: RECOVER #%u: smmu CB1 FSR %#x FSYNR0 %#x FAR %#llx -> cleared, TLB flushed\n", n, fsr,
++		    rd(be_smmu, SMMU_CB1 + 0x068), (unsigned long long)rd64(be_smmu, SMMU_CB1 + 0x060));
++		wr(be_smmu, SMMU_CB1 + 0x058, fsr);
++		wr(be_smmu, SMMU_CB1 + 0x618, 0);                 /* TLBIALL */
++		wr(be_smmu, SMMU_CB1 + 0x7f0, 0);                 /* TLBSYNC */
++		wait_bits(be_smmu, SMMU_CB1 + 0x7f4, 1u, false, 1000);
++	}
++	unsigned sqe_bad = sweet_gpu_sqe_restore();
++	printf("SWEET GPU: RECOVER #%u: SQE image %s (%u words differed); CP_INT %#x HW_FAULT %#x SQE_STAT %#x\n", n,
++	    sqe_bad ? "RESTORED" : "intact", sqe_bad, grd(g, 0x823), grd(g, 0x821), grd(g, 0x80f));
++	bool ok = false;
++	uint32_t *rb = (uint32_t *)(gpumem + GPUMEM_RB);
++	unsigned w = 0;
++	for (unsigned attempt = 0; attempt < 2 && !ok; ++attempt) {
++	if (attempt == 1) {
++		/* second try: reset again, then leave secure mode by register before the CP starts */
++		gwr(g, 0x808, 3);
++		gwr(g, 0x0043, 1);
++		(void)grd(g, 0x0043);
++		delay(200);
++		gwr(g, 0x0043, 0);
++		(void)grd(g, 0x0043);
++		delay(100);
++		gwr(g, 0xf400, 0);                        /* RBBM_SECVID_TRUST_CNTL */
++		printf("SWEET GPU: RECOVER #%u: retry with secure mode off (RBBM_SECVID_TRUST_CNTL 0), CP_INT %#x\n", n,
++		    grd(g, 0x823));
++	}
+ 	gpu_hw_regs(g, sweet_gpu_recover_gmu);
+ 
+ 	/* the ring from 0: CP_ME_INIT + CP_WHERE_AM_I, as stage 8 */
+-	uint32_t *rb = (uint32_t *)(gpumem + GPUMEM_RB);
+-	unsigned w = 0;
++	w = 0;
+ 	rb[w++] = pkt7(72, 8);                            /* CP_ME_INIT */
+ 	rb[w++] = 0x0000002f;
+ 	rb[w++] = 0x00000003;
+@@ -2353,9 +2430,11 @@
+ 	gwr(g, 0x808, 1);                                 /* CP_SQE_CNTL: start */
+ 	delay(1000);
+ 	gwr(g, 0x807, w);
+-	bool ok = be_ring_run(g, w, 500);
+-	printf("SWEET GPU: RECOVER #%u: CP_ME_INIT %s (shadow %#x want %#x, CP_INT %#x HW_FAULT %#x)\n", n,
+-	    ok ? "ran" : "FAILED", *(volatile uint32_t *)(gpumem + GPUMEM_SHADOW), w, grd(g, 0x823), grd(g, 0x821));
++	ok = be_ring_run_shadow(w, 500);
++	printf("SWEET GPU: RECOVER #%u: try %u: CP_ME_INIT %s (shadow %#x want %#x, CP_INT %#x HW_FAULT %#x rptr %#x)\n",
++	    n, attempt + 1, ok ? "ran" : "FAILED", *(volatile uint32_t *)(gpumem + GPUMEM_SHADOW), w, grd(g, 0x823),
++	    grd(g, 0x821), grd(g, 0x806));
++	}
+ 	if (ok) {
+ 		uint64_t r = 0;
+ 		uint64_t st = scm_call_svc(1u, 0x0au, 2u, 0, 0, 0, &r);   /* BOOT_SET_REMOTE_STATE(ZAP_RESUME, 0) */
+@@ -2369,7 +2448,7 @@
+ 		flush_dcache64((addr64_t)(gpumem + GPUMEM_RB), RB_SIZE, FALSE);
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 		gwr(g, 0x807, w);
+-		ok = be_ring_run(g, w, 500);
++		ok = be_ring_run_shadow(w, 500);
+ 		printf("SWEET GPU: RECOVER #%u: CP_SET_SECURE_MODE(0) %s\n", n, ok ? "ran" : "FAILED");
+ 	}
+ 	be_wptr = w;
+@@ -2411,8 +2490,15 @@
+ 		(void)PE_parse_boot_argn("sweetgpurecoverms", &rms, sizeof(rms));
+ 		sweet_gpu_recover_ms = rms != 0 && rms < 500 ? 500 : rms;
+ 	}
+-	/* 0238: stuck long enough: reset the GPU (once the 0179 report below has had its chance, at 2 s) */
+-	if (may_recover && sweet_gpu_recover_ms != 0 && be_ready && ns >= (uint64_t)sweet_gpu_recover_ms * 1000000ull) {
++	/*
++	 * 0238: stuck long enough: reset the GPU (once the 0179 report below has had its chance, at 2 s). An SMMU
++	 * translation fault latched in CB1 (an IB or buffer that is not mapped) never resolves by itself: then 500 ms.
++	 */
++	uint64_t need_ms = sweet_gpu_recover_ms;
++	if (need_ms > 500 && be_smmu && (rd(be_smmu, SMMU_CB1 + 0x058) & 2u)) {
++		need_ms = 500;
++	}
++	if (may_recover && sweet_gpu_recover_ms != 0 && be_ready && ns >= need_ms * 1000000ull) {
+ 		lck_mtx_lock(gpu_be_lock);
+ 		flush_dcache64((addr64_t)(gpumem + GPUMEM_FENCEMEM), 0x1000u, FALSE);
+ 		if (be_ready && *be_fence == done && be_seqno != done) {

@@ -1,0 +1,16 @@
+--- a/bsd/netinet/in.c
++++ b/bsd/netinet/in.c
+@@ -1141,7 +1141,12 @@
+ 	if ((cmd == SIOCAIFADDR || cmd == SIOCDIFADDR) && ifp != NULL) {
+ 		static int sweet_in_logged;
+ 		if (sweet_in_logged++ < 100) {
+-			const uint8_t *a = (const uint8_t *)&((struct in_aliasreq *)(void *)data)->ifra_addr.sin_addr;
++			/*
++			 * Through struct ifreq (32 bytes): SIOCDIFADDR carries only that, and reading it as the 64-byte
++			 * in_aliasreq tripped -fbounds-safety (panic "Bounds safety trap" in in_control, 2026-11-14, the first
++			 * time configd configured en0). The address is at +16 in both, sin_addr at +20.
++			 */
++			const uint8_t *a = (const uint8_t *)&((struct sockaddr_in *)(void *)&((struct ifreq *)(void *)data)->ifr_addr)->sin_addr;
+ 			char pname[20];
+ 			proc_name(proc_pid(p), pname, sizeof(pname));
+ 			printf("SWEET NET: %s %s %s %u.%u.%u.%u\n", pname, if_name(ifp),

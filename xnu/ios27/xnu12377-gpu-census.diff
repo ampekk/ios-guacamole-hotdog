@@ -1,0 +1,171 @@
+--- research/ios27.2/kernel-backup/SweetAccelerator.cpp.before-census	2026-11-15 08:05:40.124156716 +0000
++++ work/xnu-12377/iokit/Kernel/arm/SweetAccelerator.cpp	2026-11-15 08:05:49.299998945 +0000
+@@ -23,6 +23,8 @@
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOLib.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+@@ -127,8 +129,12 @@
+ 	bool fSystem;                   /* backboardd / SpringBoard: no pool cap, and the reserve is theirs */
+ 	bool fCapLogged;
+ 	uint32_t fFailLogs;             /* 0174: failed methods logged */
++	int fPid;                       /* 2026-11-15: for the GPU pool census */
+ 
+ 	bool v2PoolAllowed(uint64_t len);
++public:
++	void censusLine(uint64_t *listed);
++private:
+ 	IOReturn v2Method(uint32_t method, const void *in, uint32_t inSize, void *out, uint32_t *outSize);
+ 	SweetV2BO *v2Find(uint64_t handle);
+ 	IOReturn v2NewSlot(IOMemoryDescriptor *md, uint64_t bytes, bool imported, uint64_t *handle);
+@@ -198,6 +204,8 @@
+ 		return false;
+ 	}
+ 	IOLog("SWEET MTL: %s opened: GPU VA %#llx + %llu MB\n", fName, fWinBase, fWinSize >> 20);
++	fPid = proc_selfpid();
++	sweet_census_add(this);
+ 	return true;
+ }
+ 
+@@ -207,6 +215,18 @@
+  * (default 128), which stay for backboardd and SpringBoard. A refused buffer is
+  * VK_ERROR_OUT_OF_DEVICE_MEMORY in Turnip.
+  */
++/*
++ * 2026-11-15 (wallpaper lock screen): the pool was down to ~300 MB free after a respring with no client
++ * holding much in the log's window. Every open client is listed here; a refusal prints them all (at most
++ * every 10 s) with the pool memory still waiting as zombies, so the holder shows.
++ */
++#define SWEET_CENSUS_MAX 128
++static IOLock *sweet_census_lock;
++static SweetAcceleratorUserClient *sweet_census[SWEET_CENSUS_MAX];
++static void sweet_census_log(const char *why);
++static void sweet_census_add(SweetAcceleratorUserClient *c);
++static void sweet_census_remove(SweetAcceleratorUserClient *c);
++
+ bool
+ SweetAcceleratorUserClient::v2PoolAllowed(uint64_t len)
+ {
+@@ -242,6 +262,9 @@
+ 		IOLog("SWEET MTL: %s: %llu MB buffer refused (holds %llu MB, %llu MB of the pool free): %s\n", fName,
+ 		    len >> 20, fPoolBytes >> 20, sweet_gpu_pool_avail() >> 20, why);
+ 	}
++	if (why != NULL) {
++		sweet_census_log(why);
++	}
+ 	return why == NULL;
+ }
+ 
+@@ -255,6 +278,7 @@
+ void
+ SweetAcceleratorUserClient::free(void)
+ {
++	sweet_census_remove(this);
+ 	/*
+ 	 * Submits are asynchronous: a client that exits (or crashes) may leave work queued. Unmapping its
+ 	 * memory under the GPU would fault, or hand the VAs and pages to someone else while the GPU still
+@@ -456,6 +480,87 @@
+ 	IOLockUnlock(sweet_zombie_lock);
+ }
+ 
++static IOLock *
++sweet_census_lock_get(void)
++{
++	if (sweet_census_lock == NULL) {
++		IOLock *l = IOLockAlloc();
++		if (!OSCompareAndSwapPtr(NULL, l, &sweet_census_lock)) {
++			IOLockFree(l);
++		}
++	}
++	return sweet_census_lock;
++}
++
++static void
++sweet_census_add(SweetAcceleratorUserClient *c)
++{
++	IOLockLock(sweet_census_lock_get());
++	for (unsigned i = 0; i < SWEET_CENSUS_MAX; i++) {
++		if (sweet_census[i] == NULL) {
++			sweet_census[i] = c;
++			break;
++		}
++	}
++	IOLockUnlock(sweet_census_lock);
++}
++
++static void
++sweet_census_remove(SweetAcceleratorUserClient *c)
++{
++	IOLockLock(sweet_census_lock_get());
++	for (unsigned i = 0; i < SWEET_CENSUS_MAX; i++) {
++		if (sweet_census[i] == c) {
++			sweet_census[i] = NULL;
++		}
++	}
++	IOLockUnlock(sweet_census_lock);
++}
++
++static void
++sweet_census_log(const char *why)
++{
++	static uint64_t last_ns;
++	uint64_t now_ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++	if (last_ns != 0 && now_ns - last_ns < 10ULL * NSEC_PER_SEC) {
++		return;
++	}
++	last_ns = now_ns;
++	uint64_t zombie_bytes = 0, zombies = 0;
++	if (sweet_zombie_lock != NULL) {
++		IOLockLock(sweet_zombie_lock);
++		for (unsigned i = 0; sweet_zombies != NULL && i < sweet_zombies->getCount(); i++) {
++			OSData *d = OSDynamicCast(OSData, sweet_zombies->getObject(i));
++			const struct sweet_zombie *z = d != NULL ? (const struct sweet_zombie *)d->getBytesNoCopy() : NULL;
++			if (z != NULL) {
++				zombies++;
++				zombie_bytes += z->md->getLength();
++			}
++		}
++		IOLockUnlock(sweet_zombie_lock);
++	}
++	uint64_t listed = 0;
++	IOLog("SWEET MTL census (%s): pool free %llu MB; zombies %llu holding %llu MB\n", why,
++	    sweet_gpu_pool_avail() >> 20, zombies, zombie_bytes >> 20);
++	IOLockLock(sweet_census_lock_get());
++	for (unsigned i = 0; i < SWEET_CENSUS_MAX; i++) {
++		SweetAcceleratorUserClient *c = sweet_census[i];
++		if (c != NULL) {
++			c->censusLine(&listed);
++		}
++	}
++	IOLockUnlock(sweet_census_lock);
++	IOLog("SWEET MTL census: clients hold %llu MB in all\n", listed >> 20);
++}
++
++void
++SweetAcceleratorUserClient::censusLine(uint64_t *listed)
++{
++	*listed += fPoolBytes;
++	IOLog("SWEET MTL census:   %s[%d] holds %llu MB (peak %llu MB)\n", fName, fPid, fPoolBytes >> 20, fPoolPeak >> 20);
++}
++
+ /* Unmap from the GPU, unwire, drop (pool memory: once no task maps it any more) */
+ void
+ SweetAcceleratorUserClient::v2Release(SweetV2BO *bo)
+@@ -532,7 +637,11 @@
+ 		/* memory XNU does not manage (no cacheable alias), zeroed through a WC kernel view */
+ 		sweet_zombie_sweep();
+ 		uint64_t len = round_page_64(rq->bytes), pa = 0;
+-		if (!v2PoolAllowed(len) || sweet_gpu_pool_alloc(len, &pa)) {
++		if (!v2PoolAllowed(len)) {
++			return kIOReturnNoMemory;
++		}
++		if (sweet_gpu_pool_alloc(len, &pa)) {
++			sweet_census_log("no run of free pool chunks that long");
+ 			return kIOReturnNoMemory;
+ 		}
+ 		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, len, kIODirectionInOut);

@@ -1,0 +1,79 @@
+diff --git a/UniXNU/scripts/build-adreno-metal-bridge.py b/UniXNU/scripts/build-adreno-metal-bridge.py
+index 91147a3..9e8e1ba 100644
+--- a/UniXNU/scripts/build-adreno-metal-bridge.py
++++ b/UniXNU/scripts/build-adreno-metal-bridge.py
+@@ -50,7 +50,10 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
+     '0040-unixnu-runtime-on-development-555b13d5.patch',
+     # A driver that compiles inside the call: pipeline makings stay on the asking thread (METAL2VULKAN_COMPILE_ON_ASKING_THREAD=1)
+     # instead of a thread started for each, which a thread without a quality-of-service class waited for.
+-    '0041-compile-on-the-asking-thread.patch']]
++    '0041-compile-on-the-asking-thread.patch',
++    # A program waiting for room that sees no progress for 50 ms hands its slot to the lowering thread again, then lowers on its own
++    # thread (Candy Crush froze 10 s with its main thread in wait_for_room and the lowering thread parked: a lost hand-off).
++    '0042-wait-for-room-recovers-a-lost-hand-off.patch']]
+ 
+ 
+ def git_tree(*steps):
+diff --git a/UniXNU/drivers/AdrenoMetal/bridge/patches/0042-wait-for-room-recovers-a-lost-hand-off.patch b/UniXNU/drivers/AdrenoMetal/bridge/patches/0042-wait-for-room-recovers-a-lost-hand-off.patch
+new file mode 100644
+index 0000000..b74f8e2
+--- /dev/null
++++ b/UniXNU/drivers/AdrenoMetal/bridge/patches/0042-wait-for-room-recovers-a-lost-hand-off.patch
+@@ -0,0 +1,57 @@
++--- a/crates/metal2vulkan-runtime/src/render/deferral.rs
+++++ b/crates/metal2vulkan-runtime/src/render/deferral.rs
++@@ -978,9 +978,18 @@
++ /// handed and not taken, until the lowering thread takes one (the module docs); where `worker`,
++ /// the device's lowering thread, is none, lowers no more or left the slot, or the process exits,
++ /// lower them on this thread instead.
++-fn wait_for_room(slot: &LoweringSlot, device: &Device, worker: Option<&LoweringWorker>) {
+++///
+++/// A wait that sees no progress for [`exit_guard::WAKE`] (the slot not being lowered and its
+++/// batches still all handed) hands the slot to the thread again, and after two more such waits
+++/// lowers the batches on this thread, as where the thread lowers no more. (ios-sweet guacamole,
+++/// 2026-11-19: Candy Crush froze 10 s at a time with its main thread here, the slot `queued`, and
+++/// the lowering thread parked with an empty queue: a hand-off lost somewhere. A slot handed twice
+++/// is harmless: the thread finds nothing left the second time and leaves it unqueued.) Each such
+++/// recovery is counted in [`ROOM_STALLS`].
+++fn wait_for_room(slot: &Arc<LoweringSlot>, device: &Device, worker: Option<&LoweringWorker>) {
++     let mut state = lock(&slot.state);
++     device.shared().counts.render_log_waited();
+++    let mut stalls = 0u32;
++     loop {
++         if state.handed.len() < HANDED_BATCHES {
++             return;
++@@ -989,11 +998,33 @@
++         if !lowers || exit_guard::closed() || state.panicked {
++             break;
++         }
++-        state = (slot.handed_back.wait(state)).unwrap_or_else(std::sync::PoisonError::into_inner);
+++        let handed = state.handed.len();
+++        let (next, waited) = (slot.handed_back.wait_timeout(state, exit_guard::WAKE))
+++            .unwrap_or_else(std::sync::PoisonError::into_inner);
+++        state = next;
+++        if !waited.timed_out() || state.busy || state.handed.len() < handed {
+++            stalls = 0;
+++            continue;
+++        }
+++        stalls += 1;
+++        ROOM_STALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+++        if stalls >= 3 {
+++            break;
+++        }
+++        if stalls == 1 {
+++            if let Some(worker) = worker {
+++                drop(state);
+++                worker.hand(slot);
+++                state = lock(&slot.state);
+++            }
+++        }
++     }
++     slot.drain_locked(state, 0, |_, _| ());
++ }
++ 
+++/// Waits for room that saw no progress for [`exit_guard::WAKE`] and recovered ([`wait_for_room`]).
+++pub static ROOM_STALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+++
++ /// The call being lowered on this thread, which the notices announced while it runs name, and a
++ /// notice of a kind the device refuses while lowering, which refuses it (the module docs).
++ pub(crate) mod lowering {

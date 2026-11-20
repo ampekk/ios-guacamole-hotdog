@@ -1,0 +1,84 @@
+--- a/osfmk/kern/sched_clutch.c
++++ b/osfmk/kern/sched_clutch.c
+@@ -3199,6 +3199,46 @@
+ 
+ #endif /* !SCHED_TEST_HARNESS */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * sweet 2026-11-17 (big-first, take 3): the big-first masks (osfmk/kern/processor.c sweet_sched_cpu_masks:
++ * preferred = the A76s cpu4-7, migrate = the A55s cpu0-3) only steer a thread when it is placed. Clutch has no
++ * "avoid this processor" check, so a thread that keeps running (Settings' main thread while scrolling: ~80 % busy,
++ * ptop: cpu0 83 % busy, the big cores ~35 %) stays on the little core it happened to land on. Like Edge's
++ * sched_edge_thread_avoid_processor: a non-real-time, unbound thread on a migrate-mask CPU yields that CPU when a
++ * recommended CPU outside the mask is idle; thread_setrun then places it there (choose_processor prefers the
++ * preferred mask). With the masks at 0 (sweetbigfirst=0) this never fires.
++ */
++uint64_t sweet_avoid_moves;     /* read and reset by SweetFramebuffer's 5 s statistics (no console I/O in here:
++                                 * this runs in the scheduler with interrupts off -> "Console I/O from
++                                 * interrupt-disabled context" panic, 2026-11-17) */
++
++static bool
++sweet_clutch_thread_avoid_processor(processor_t processor, thread_t thread, ast_t reason)
++{
++	processor_set_t pset = processor->processor_set;
++	/*
++	 * Take 3: only at quantum expiry (as Edge does), i.e. for threads that ran a whole quantum on a little core.
++	 * Take 2 checked every context-switch check: 6,000-32,000 moves a second (every IPC handoff and wakeup
++	 * landing on cpu0-3 was bounced at once), 444 % CPU in all instead of 246 %, no fps gained.
++	 */
++	if (!(reason & AST_QUANTUM)) {
++		return false;
++	}
++	if (thread->bound_processor != PROCESSOR_NULL || thread->sched_pri >= BASEPRI_RTQUEUES ||
++	    !bit_test(pset->perfcontrol_cpu_migration_bitmask, processor->cpu_id)) {
++		return false;
++	}
++	uint64_t idle = pset->cpu_state_map[PROCESSOR_IDLE] & pset->recommended_bitmask &
++	    ~pset->perfcontrol_cpu_migration_bitmask;
++	if (idle == 0) {
++		return false;
++	}
++	os_atomic_inc(&sweet_avoid_moves, relaxed);
++	return true;
++}
++#endif
++
+ const struct sched_dispatch_table sched_clutch_dispatch = {
+ 	.sched_name                                     = "clutch",
+ 	.init                                           = sched_clutch_init,
+@@ -3219,8 +3259,13 @@
+ 	.processor_runq_count                           = sched_clutch_runq_count,
+ 	.processor_bound_count                          = sched_clutch_processor_bound_count,
+ 	.multiple_psets_enabled                         = TRUE,
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	.avoid_processor_enabled                        = TRUE,
++	.thread_avoid_processor                         = sweet_clutch_thread_avoid_processor,
++#else
+ 	.avoid_processor_enabled                        = FALSE,
+ 	.thread_avoid_processor                         = NULL,
++#endif
+ 	.update_thread_bucket                           = sched_clutch_update_thread_bucket,
+ 	.cpu_init_completed                             = NULL,
+ 	.thread_eligible_for_pset                       = NULL,
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -100,6 +100,7 @@
+  * blits it alone (no CPU composition).
+  */
+ extern "C" int proc_selfpid(void);
++extern "C" uint64_t sweet_avoid_moves;  /* osfmk/kern/sched_clutch.c: threads moved off a little core */
+ extern "C" uint32_t sweet_mtl_pid_submits(int pid, uint32_t *last_fence);      /* SweetAccelerator.cpp, 0169 */
+ /* 0151: frame statistics, logged every 5 s while frames come (swaps; shown at the swap, at a vsync; GPU busy) */
+ static struct {
+@@ -970,6 +971,10 @@
+ 				    sweet_fb_stats.composed, us / sweet_fb_stats.composed, sweet_fb_stats.comp_opaque,
+ 				    sweet_fb_stats.comp_blend, sweet_fb_stats.comp_skipped, sweet_fb_stats.comp_gpu_wait);
+ 			}
++			uint64_t moves = __atomic_exchange_n(&sweet_avoid_moves, 0, __ATOMIC_RELAXED);
++			if (moves != 0) {
++				IOLog("SWEET SCHED: 5s: %llu threads moved off a little core to an idle big one\n", moves);
++			}
+ 			IOLog("SWEET FB: 5s: display-time samples: game layer %u frames, %u black; other top layer %u frames, %u black\n",
+ 			    sweet_fb_stats.seen_game, sweet_fb_stats.black_game, sweet_fb_stats.seen_other, sweet_fb_stats.black_other);
+ 			if (sweet_fb_stats.top_clear != 0) {

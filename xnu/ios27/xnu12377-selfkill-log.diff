@@ -1,0 +1,22 @@
+--- research/ios27.2/kernel-backup/kern_sig.c.before-selfkill	2026-11-14 07:57:25.641767259 +0000
++++ work/xnu-12377/bsd/kern/kern_sig.c	2026-11-14 07:57:25.653731788 +0000
+@@ -1408,6 +1408,19 @@
+ 			return EPERM;
+ 		}
+ 		if (uap->signum) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			/*
++			 * SWEET: iOS 27.2 backboardd, SpringBoard and others SIGKILL themselves (launchd: "exited due to
++			 * SIGKILL | sent by backboardd"); print where (the same report as a crash) for the first 60.
++			 */
++			static int sweet_selfkill_logged;
++			if (uap->signum == SIGKILL && p == cp && sweet_selfkill_logged < 60) {
++				extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
++				sweet_selfkill_logged++;
++				printf("SELFKILL %s[%d]\n", cp->p_comm, proc_getpid(cp));
++				sweet_crash_log(cp->p_comm, proc_getpid(cp), SIGKILL, 0, 0);
++			}
++#endif
+ 			psignal(p, uap->signum);
+ 		}
+ 		proc_rele(p);

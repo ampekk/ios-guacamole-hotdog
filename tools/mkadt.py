@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
+
+Only what the early boot path actually reads (see NOTES.md); every MMIO
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--guacamole|--hotdog] [--scale2] [--ram5g]
+
+--guacamole and --hotdog select the two OnePlus SM8150 phones this port runs
+on. They share the SoC-level addresses, panel size, firmware blobs and ADT
+nodes; PHONE below is true for either. See docs/hotdog.md for the hardware
+facts that still need on-device validation on a 7T Pro.
+"""
+import hashlib, os, struct, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import adt  # noqa: E402
+
+# Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
+PHYS_BASE = 0xb0000000
+MEM_SIZE = 0x4d000000
+# Panic log buffer, carved from the TOP of the dram range and exposed to XNU as
+# /pram + /chosen/embedded-panic-log-size. Without it, pe_init.c's
+# check_for_panic_log() leaves gPanicBase == 0, debug_log_init() bails out twice
+# and the kernel hangs right after "kdp_core zlib memory" — reproduced on QEMU
+# and independently on ios-fajita.
+PANIC_LOG_SIZE = 0x100000
+# --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
+# <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
+# carve-out is in the low bank and the dynamic pools are limited below 4G.
+HIGH_PHYS_BASE = 0x100000000
+HIGH_MEM_SIZE = 0xfcc00000
+# /arm-io children are relative to this; it must not be 0 (serial_init bails)
+SOC_BASE = 0x01000000
+
+GICD, GICD_SIZE = 0x17a00000, 0x10000
+GICR, GICR_SIZE = 0x17a60000, 0x100000
+FB, FB_SIZE = 0x9c000000, 0x1700000
+SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
+FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
+# --guacamole: OnePlus 7 Pro (SM8150). Same SoC-level addresses as sweet
+# (GIC, UFS, SPMI); the ABL splash is 1440x3120 a8r8g8b8 at the same address.
+# Its DDR is 0x80000000-0xbbb00000 + 0xc0000000-0x280000000 (8 GB): the
+# --highmem window 0x100000000+0xfcc00000 is RAM with no fixed carve-outs, but
+# the low PHYS_BASE window crosses the 0xbbb00000 hole, so use --highmem.
+# --hotdog: OnePlus 7T Pro (SM8150-AC, HD1911/HD1913). Same SM8150 addresses,
+# same 1440x3120 DSI/DSC panel, S6SY761 touch, WCN3990 Wi-Fi, AW8697 haptics
+# and Adreno 640 firmware as guacamole, so everything guarded by PHONE is
+# shared. DDR extent, GPU OPPs and the Wi-Fi board-id file are the values to
+# confirm on the device (docs/hotdog.md). The 12 GB variant still fits the
+# fixed --ram5g window inside its first 8 GB.
+GUACAMOLE = '--guacamole' in sys.argv
+HOTDOG = '--hotdog' in sys.argv
+if GUACAMOLE and HOTDOG:
+    sys.exit('choose one board: --guacamole or --hotdog')
+PHONE = GUACAMOLE or HOTDOG
+BOARD = 'hotdog' if HOTDOG else 'guacamole' if GUACAMOLE else 'sweet'
+# --scale2: present an @2x screen, 828x1792 (414x896 points, the iPhone XR / 11 screen; 375x812 @2x has no UIKit
+# status bar layout), with kernel boot-arg sweetfb_scale=2 (xnu 0240 + 0241): 1.85x fewer pixels to draw. MobileGestalt caches the screen: move its cache aside after switching.
+SCALE2 = '--scale2' in sys.argv
+# --ram5g (OnePlus SM8150 phones, 2026-11-17): XNU's window grows upward to 5 GiB, 0x100000000-0x240000000 (was 0xfcc00000 =
+# 3.95 GiB, a size inherited from sweet's memory node). DDR runs on to 0x280000000. Take 1 (window from 0xc0000000)
+# went to QUALCOMM CrashDump about a minute into the boot: 0xc0000000-0xffffffff holds fixed buffers of ours that XNU
+# must not hand out (wland's radio pool 0xe0000000, adspd's FastRPC heap/buffers/PCM 0xfd800000-0xfe9xxxxx, which it
+# assigns to the ADSP, and the GPU zap metadata 0xf0000000). The GPU pool (sweet_gpu.c gpu_pool_ranges) gives up the
+# 1 GiB above the new window and takes about 1 GiB of DDR XNU does not use instead (the old low ranges plus free
+# low-bank gaps), keeping ~2 GiB.
+RAM5G = '--ram5g' in sys.argv
+if RAM5G:
+    HIGH_PHYS_BASE, HIGH_MEM_SIZE = 0x100000000, 0x140000000
+if PHONE:
+    FB_W, FB_H, FB_STRIDE = 1440, 3120, 1440 * 4
+    FB_SIZE = 0x1200000
+# Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
+UFS, UFS_SIZE = 0x01d84000, 0x3000
+TIMEBASE = 19200000
+VTIMER_INTID = 19
+# QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
+QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
+QEMU_VTIMER_INTID = 27
+
+BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
+
+# The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
+# derives product type, device class, home-button-less UI, artwork etc. from
+# the root identity and /product of the real D22AP device tree. That tree is
+# an Apple artifact (kept out of git): extract it from the IPSW with
+#   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
+#   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
+D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
+# --identity d73: present the iPhone 14 Pro the iOS 26 IPSW is for (iPhone15,2 / D73AP), so MobileGestalt's
+# ProductType / marketing name ("iPhone 14 Pro" in Settings > About) and /product match the userland. Needs the
+# decoded D73AP device tree (LZFSE inside the IM4P; decode on the Mac):
+#   ipsw img4 im4p extract research/ios26/DeviceTree.d73ap.im4p -o research/ios26/d73ap.adt
+# chip-id, ECID and /chosen/manifest-properties stay as before on purpose: IOPlatformUUID (ByHost prefs, the
+# kernel's migration-skip plist A9683613-...) is derived from chip-id + ECID, and cryptexd already accepts them.
+D73AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ios26/d73ap.adt')
+IDENTITY = sys.argv[sys.argv.index('--identity') + 1] if '--identity' in sys.argv else 'd22'
+if IDENTITY not in ('d22', 'd73'):
+    sys.exit('--identity: d22 (iPhone X, default) or d73 (iPhone 14 Pro)')
+IDENT_ADT = D73AP_ADT if IDENTITY == 'd73' else D22AP_ADT
+
+
+def d22ap_product_child(child, path=None):
+    path = path or IDENT_ADT
+    """Properties of one child node of the real D22AP /product (e.g. 'audio'), or None."""
+    if not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            for cc in c.children:
+                if dict((k, v) for k, f, v in cc.props).get('name') == child.encode() + b'\0':
+                    return [(k, v) for k, f, v in cc.props if not f and k not in ('name', 'AAPL,phandle')]
+    return None
+
+
+def d22ap_product(path=None):
+    path = path or IDENT_ADT
+    if IDENTITY == 'd73' and not os.path.exists(path):
+        sys.exit(f'--identity d73 needs {path} (see D73AP_ADT above)')
+    """/product properties of the real D22AP tree, without the syscfg
+    placeholders iBoot would fill in (flag bit set) and the node bookkeeping."""
+    if not os.path.exists(path):
+        print(f'warning: {path} missing, no /product node', file=sys.stderr)
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+    raise SystemExit(f'{path}: no /product node')
+
+u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
+u64 = lambda *v: struct.pack('<%dQ' % len(v), *v)
+cstr = lambda s: s.encode() + b'\0'
+
+
+def node(name, props=(), children=()):
+    n = adt.Node()
+    n.props = [('name', 0, cstr(name))] + [(k, 0, v) for k, v in props]
+    n.children = list(children)
+    return n
+
+
+# OnePlus SM8150 phones: Adreno 640 firmware for the kernel's GPU bring-up
+# (sweet_gpu.c, ADT /sweet-gpu), pulled from the phone's /vendor/firmware (not
+# in git). hotdog (855+) runs the same A640 firmware; only its OPP table is
+# faster, which is read from cmd-db at runtime, not from this ADT.
+GPU_FW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/gpu/fw')
+
+
+def guac_gpu_node(ph):
+    gmu = os.path.join(GPU_FW_DIR, 'a640_gmu.bin')
+    if not os.path.exists(gmu):
+        print(f'warning: {gmu} missing, no /sweet-gpu node', file=sys.stderr)
+        return []
+    props = [ph(), ('compatible', cstr('qcom,adreno-640.1'))]
+    for prop, name, limit in (('gmu-firmware', 'a640_gmu.bin', 0x40000),
+                              ('sqe-firmware', 'a630_sqe.fw', 0x8004),
+                              ('zap-metadata', 'a640_zap.mdt', 0x4000),
+                              ('zap-b00', 'a640_zap.b00', 0x4000),
+                              ('zap-b01', 'a640_zap.b01', 0x10000),
+                              ('zap-b02', 'a640_zap.b02', 0x10000)):
+        path = os.path.join(GPU_FW_DIR, name)
+        if not os.path.exists(path):
+            print(f'warning: {path} missing', file=sys.stderr)
+            continue
+        blob = open(path, 'rb').read()
+        if not 0 < len(blob) <= limit or len(blob) % 4:
+            raise ValueError(f'{name}: unexpected size {len(blob)}')
+        props.append((prop, blob))
+    return [node('sweet-gpu', props)]
+
+
+# OnePlus SM8150 phones: the AW8697 haptics driver's RAM waveforms
+# (bsd/dev/sweet_haptic.c, ADT /sweet-haptic), from the phone's /vendor/firmware
+# (OnePlus; not in git): the set for this motor's resonance (f0 168.9 Hz -> _168).
+# hotdog ships the same AW8697; copy its waveform blob from that phone.
+HAPTIC_RAM = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../dtb/haptics/aw8697_haptic_168.bin')
+
+
+def guac_haptic_node(ph):
+    if not os.path.exists(HAPTIC_RAM):
+        print(f'warning: {HAPTIC_RAM} missing, no /sweet-haptic node', file=sys.stderr)
+        return []
+    blob = open(HAPTIC_RAM, 'rb').read()
+    # checksum (2 bytes, big-endian) = sum of every byte after it; then base address (2) and the samples
+    if not 8 < len(blob) <= 0x4000 or ((blob[0] << 8) | blob[1]) != (sum(blob[2:]) & 0xffff):
+        raise ValueError(f'{HAPTIC_RAM}: bad size or checksum')
+    return [node('sweet-haptic', [ph(), ('compatible', cstr('awinic,aw8697')), ('ram', blob)])]
+
+
+def build(seed=None, qemu=False, highmem=False):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    # Carve the panic log off the top so the kernel never allocates over it.
+    panic_base = phys_base + mem_size - PANIC_LOG_SIZE
+    mem_size -= PANIC_LOG_SIZE
+    gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
+    # 256 bytes: xnu-12377 (iOS 26) asks the bootloader for 4 * SEED_SIZE and panics with less
+    # ("Expected 256 seed bytes from bootloader, but got 64"); xnu-8796 takes the first 64.
+    seed = seed if seed is not None else os.urandom(256)
+    phandle = iter(range(1, 1000))
+    ph = lambda: ('AAPL,phandle', u32(next(phandle)))
+
+    chosen = node('chosen', [
+        ph(),
+        ('dram-base', u64(phys_base)),
+        ('dram-size', u64(mem_size)),
+        ('random-seed', seed),
+        # XNU 12377's ml_unsafe_kernel_text_init() requires this iBoot-populated
+        # flag in /chosen even on SWEET, where CTRR is absent. Zero means CTRR
+        # is disabled and marks kernel text as unsafe/writable for the pmap
+        # policy path; omitting it leaves initialization false and panics.
+        ('kernel-ctrr-to-be-enabled', u32(0)),
+        ('debug-enabled', u32(1)),
+        ('embedded-panic-log-size', u32(PANIC_LOG_SIZE)),
+        ('firmware-version', cstr('sweet-shim')),
+        ('system-firmware-version', cstr('sweet-shim')),
+        # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
+        # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
+        # tolerating a missing directory). Fixed stand-in value.
+        ('boot-manifest-hash', BOOT_MANIFEST_HASH),
+        # libimg4 (cryptexd) aborts "failed to get crypto algorithm" without
+        # it; real A11+ device trees say sha2-384.
+        ('crypto-hash-method', cstr('sha2-384')),
+        # MobileGestalt's screen class: display-scale (u32, default 0) comes
+        # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
+        # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
+        # 360x800 points (like iPhone X class devices).
+        ('display-scale', u32(2 if SCALE2 else 3)),
+        # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
+        # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
+        # files), so e.g. DataMigration never records LastSystemVersion and
+        # migrates on every boot. Synthetic ECID (not the phone's); chip-id
+        # of the A11 that the iPhone X userland expects.
+        ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
+        ('chip-id', u32(0x8015)),
+        # MobileGestalt's WifiAddress/BluetoothAddress/EthernetAddress come
+        # from these; without mac-address-wifi0 it waits 5 s for a Wi-Fi
+        # IONetworkController on every query, and installd asks once per
+        # bundle, so LaunchServices' rebuild crawls (ios-flame's finding,
+        # HANDOFF "Black wallpaper fixed"). Locally administered, ours.
+        ('mac-address-wifi0', bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x01])),
+        ('mac-address-bluetooth0', bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x02])),
+        ('mac-address-ethernet0', bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x03])),
+        # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
+        # MobileGestalt reads these from /chosen, and mobileactivationd's
+        # DeviceType then takes its native "Hactivation" branch (state
+        # Activated without an activation record; no SEP, no baseband here).
+        ('certificate-production-status', u32(0)),
+        ('effective-production-status-ap', u32(0)),
+        ('certificate-security-mode', u32(1)),
+        ('effective-security-mode-sep', u32(1)),
+    ], [node('memory-map', [ph()]),
+        # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
+        # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
+        # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
+        # The iOS shared cache is in no trust cache, so dyld can only map it
+        # with CSR_ALLOW_UNRESTRICTED_FS (vm_unix.c shared region checks).
+        node('asmb', [ph(), ('lp-sip0', u64(0x6f)), ('lp-sip1', u32(1))]),
+        # libimage4 (cryptexd, iOS 26) panics "failed to get manifest properties" unless
+        # IODeviceTree:/chosen/manifest-properties exists (iBoot publishes the boot manifest's
+        # properties there). Values mirror the identity above (A11 chip, D22 board, dev-fused).
+        node('manifest-properties', [ph(), ('CHIP', u32(0x8015)), ('BORD', u32(6)),
+            ('ECID', struct.pack('<Q', SWEET_ECID)), ('CPRO', u32(0)), ('CSEC', u32(1)),
+            ('SDOM', u32(1)), ('EPRO', u32(0)), ('ESEC', u32(1)),
+            ('BNCH', hashlib.sha384(b'sweet boot nonce').digest())])])
+
+    # SWEET SMP: all eight cores in physical-core order (0-5 Cortex-A55,
+    # 6-7 Cortex-A76), one homogeneous cluster. The kernel defaults to one
+    # and uses cpus=N to select an initial prefix (N <= 8).
+    # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
+    cpu_nodes = []
+    for core in range(1 if qemu else 8):
+        cpu_nodes.append(node(f'cpu{core}', [
+            ph(),
+            ('device_type', cstr('cpu')),
+            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
+            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
+            ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
+            ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
+            ('die-cluster-id', u32(0)),
+            ('cluster-core-id', u32(core)),
+            ('l2-cache-id', u32(core)),  # distinct per-core L2 nodes in live FDT
+            ('l3-cache-id', u32(0)),     # shared L3
+            ('state', cstr('running' if core == 0 else 'stopped')),
+            ('timebase-frequency', u32(timebase)),
+            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            ('bus-frequency', u32(100000000)),
+            ('memory-frequency', u32(1866000000)),
+            ('peripheral-frequency', u32(timebase)),
+            ('fixed-frequency', u32(timebase)),
+        ]))
+    cpus = node('cpus', [ph(), ('#address-cells', u32(1)),
+                         ('#size-cells', u32(0))], cpu_nodes)
+
+    gic = node('gic', [
+        ph(),
+        ('compatible', cstr('arm,gic-v3')),
+        ('interrupt-controller', b''),
+        ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
+        ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
+    ])
+    arm_io = node('arm-io', [
+        ph(),
+        ('device_type', cstr('sweet-io')),
+        ('compatible', cstr('sweet-io') + cstr('arm-io')),
+        ('#address-cells', u32(2)),
+        ('#size-cells', u32(2)),
+        ('ranges', u64(0, SOC_BASE, 0x100000000 - SOC_BASE)),
+    ], [gic,
+        # No hardware: watchdogd checks IODeviceTree:/arm-io/wdt for no-pmu and
+        # otherwise crashes trying to set the PMU boot stage (customer builds
+        # ignore the -wdt_no_pmu boot-arg).
+        node('wdt', [ph(), ('no-pmu', u32(1))])] + ([
+        # OnePlus SM8150 phones: launchd starts wifid only when the device tree has a
+        # "wlan" node (com.apple.wifid _LimitLoadToDeviceTree = wlan,
+        # marconi-wifi); the kernel's en0 + Apple80211 (0139, flame_wlan.c)
+        # answer it. As ios-flame's mkadt.py. Phone wifi27: no wifid without it.
+        # The compatible string is the board's own; matching is on device_type.
+        node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr(f'{BOARD},wcn3990')),
+        ]),
+        # OnePlus SM8150 phones: retain the D73/iPhone 14 Pro product identity, but publish the UART Bluetooth service
+        # at the D22 path that bluetoothd/Marconi looks for: /arm-io/uart1/bluetooth. The live iOS 27.2 tree
+        # previously exposed a standalone /arm-io/bluetooth nub; ioreg showed that nub registered, while
+        # bluetoothd still logged "Unable to match bluetooth service in device tree". The WCN3998 is behind
+        # QUP wrapper 2 SE3 and remains driven by userland (userland/bt/); this uart1 node is the service topology
+        # expected by Apple's Bluetooth stack, not a claim that the Samsung UART hardware is present.
+        node('uart1', [
+            ph(),
+            ('device_type', cstr('uart')),
+            ('compatible', cstr('uart-1,samsung')),
+            ('uart-version', u32(1)),
+        ], [node('bluetooth', [
+            ph(),
+            ('device_type', cstr('bluetooth')),
+            ('compatible', cstr('bluetooth,n88')),
+            ('transport-speed', u32(3000000)),
+            ('transport-encoding', u32(3)),
+            ('vendor-id', u32(0x05ac)),
+            ('product-id', u32(0x12a0)),
+            ('coex', u32(2)),
+            ('local-mac-address', bytes([0x02, 0x53, 0x57, 0x45, 0x45, 0x02])),
+        ])])] if PHONE else []) + [
+        # Main display: IOMobileFramebuffer.framework counts /arm-io children
+        # with this device_type and reads the canvas size from the node
+        # (the presented iPhone X size, see SweetFramebuffer.cpp);
+        # the kernel's AppleCLCD matches the compatible string.
+        node('disp0', [
+            ph(),
+            ('device_type', cstr('display-subsystem')),
+            ('compatible', cstr('sweet,display')),
+            # d73: the iPhone 14 Pro's 1179x2556 (393x852 pt @3x; 2.168:1, the panel is 2.167:1).
+            ('canvas-width', u32(828 if SCALE2 else (1179 if IDENTITY == 'd73' else 1125))),
+            ('canvas-height', u32(1792 if SCALE2 else (2556 if IDENTITY == 'd73' else 2436))),
+        ])])
+
+    fbcon = node('sweet-fbcon', [
+        ph(),
+        ('reg', u64(FB, FB_SIZE)),
+        ('width', u32(FB_W)),
+        ('height', u32(FB_H)),
+        ('stride', u32(FB_STRIDE)),
+    ])
+
+    # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
+    ufs = node('sweet-ufs', [
+        ph(),
+        ('compatible', cstr('qcom,ufshc')),
+        ('reg', u64(UFS, UFS_SIZE)),
+    ])
+
+    # pmap_compute_max_asids requires the node even when no overrides are set.
+    # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
+    # No effaceable storage: keybagd then reads /private/var/keybags/systembag.kb
+    # as a plain plist instead of decrypting it with the effaceable key.
+    # kern.maxvnodes: xnu's xsmall CONFIG_VNODES caps desiredvnodes at 1024 ("vnode: table is full" on iOS 26);
+    # PE_get_default("kern.maxvnodes") in bsd_startupearly overrides it uncapped.
+    # sleep-disabled (2026-11-17): IOPMrootDomain reads it at boot-completed (PE_get_default -> gSleepDisabledFlag) and then
+    # refuses idle and demand system sleep. There is no S2R here: a system sleep ended in PLATFORM_PRE_SLEEP and the
+    # panic "SWEET CPU: CPU halt/suspend is not implemented" (SweetCPU::haltCPU). Display off is unaffected.
+    defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1)), ('kern.maxvnodes', u32(65536)),
+                                 ('sleep-disabled', u32(1))])
+
+    # MobileGestalt HomeButtonType = IODeviceTree:/buttons home-button-type
+    # (D22AP: 2, no Home button; absent = 0 = Home-button device).
+    buttons = node('buttons', [
+        ph(),
+        ('button-names', cstr('volup') + cstr('voldown') + cstr('hold')),
+        ('home-button-type', u32(2)),
+        ('opposed-power-vol-buttons', u32(1)),
+    ])
+
+    product_props = d22ap_product()
+    if product_props and PHONE:
+        # The panel is 8-bit sRGB and backboardd's GL path draws BGRA only. With the
+        # iPhone X's P3 answer WebKit asks for 10-bit 'w30r' / 'b3a8' page tiles, which its
+        # GPU process never fills here (Safari black, jb1/jb2: "CGImageCreate: invalid
+        # image bits/pixel or bytes/row"); its BGRA surfaces it draws.
+        product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
+    # /product/audio of the D22AP tree ({wireless-splitter 1, supports-always-listening 1}): VirtualAudio reads
+    # IODeviceTree:/product/audio while it sets up its ports, and without it ("IORegistryEntryFromPath
+    # IODeviceTree:/product/audio returned MACH_PORT_NULL") it publishes only the Null_Device / AP ports, no speaker
+    # (apps: AQMEIO "Error -1 getting output port ID": no sound, YouTube in Safari fails, no Bluetooth audio).
+    # /product/haptics of the D22AP tree ({closed-loop 1, supports-3rd-party-haptics 1}): MobileGestalt derives
+    # DeviceSupportsClosedLoopHaptics / DeviceSupportsHaptics from it when it (re)builds its cache (a new boot image
+    # drops answers set by hand with mgtool). Wanted since 2026-11-11: with both true mediaserverd's Haptic 2.0 engine
+    # plays every haptic on HakiosAudio's Actuator -> /dev/hakios-haptic (xnu 0255) and VirtualAudio creates
+    # VirtualAudioDevice_Actuator (it needs DeviceSupportsHaptics). Before HakiosAudio this node was left out (VibeSynth
+    # had no device then). mkadt option --no-product-haptics restores that.
+    product_children = []
+    audio_props = d22ap_product_child('audio') if PHONE else None
+    if audio_props is not None:
+        product_children.append(node('audio', [ph()] + audio_props))
+    haptics_props = d22ap_product_child('haptics') if PHONE and '--no-product-haptics' not in sys.argv else None
+    if haptics_props is not None:
+        product_children.append(node('haptics', [ph()] + haptics_props))
+    product = [node('product', [ph()] + product_props, product_children)] if product_props else []
+
+    # Panic log region. /pram reg = <phys size>; it sits just above the
+    # dram-size we expose, so XNU maps it but never allocates into it.
+    pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
+
+    # Identity of the iPhone X whose userland runs here: compatible[0] is
+    # hw.model/hw.target (D22AP), model is hw.machine/hw.product
+    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    IDENT = ('D73AP', 'iPhone15,2', 'D73') if IDENTITY == 'd73' else ('D22AP', 'iPhone10,3', 'D22')
+    # Keep the historical 'xiaomi,sweet' / 'qcom,sm7150' entries for the kernel's
+    # SweetPlatformExpert match; add the real SoC for the OnePlus boards.
+    soc = cstr('qcom,sm8150') if PHONE else b''
+    if product_props:
+        print(f'/product ({IDENTITY}): ' + ' '.join(k for k, v in product_props), file=sys.stderr)
+    return node('device-tree', [
+        ph(),
+        ('compatible', cstr(IDENT[0]) + cstr(IDENT[1]) + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + soc + cstr('AppleARM')),
+        ('model', cstr(IDENT[1])),
+        ('target-type', cstr(IDENT[2])),
+        ('target-sub-type', cstr(IDENT[0])),
+        ('manufacturer', cstr('Apple Inc.')),
+        ('#address-cells', u32(2)),
+        ('#size-cells', u32(2)),
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + (guac_gpu_node(ph) + guac_haptic_node(ph) if PHONE and not qemu else []) + product + ([] if qemu else [ufs]))
+
+
+if __name__ == '__main__':
+    if PHONE and '--highmem' not in sys.argv:
+        sys.exit(f'--{BOARD} needs --highmem (the low window crosses a DDR hole)')
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    blob = adt.serialize(root)
+    open(sys.argv[1], 'wb').write(blob)
+    if '--dump' in sys.argv:
+        adt.dump(adt.parse(blob)[0])
+    print(f'{sys.argv[1]}: {len(blob)} bytes', file=sys.stderr)

@@ -1,0 +1,66 @@
+--- a/bsd/dev/sweet_rtc.c
++++ b/bsd/dev/sweet_rtc.c
+@@ -133,4 +133,52 @@
+ 		clock_set_calendar_microtime((clock_sec_t)now, 0);
+ 	}
+ }
++
++/*
++ * Power off and restart (2026-11-14): iOS's shutdown and restart got as far as "MACH Reboot" and then stopped,
++ * because nothing set PE_halt_restart (IOPlatformExpert::haltRestart returns -1 without it). The SM8150's
++ * firmware implements PSCI (SMC conduit, as Linux's psci node on this phone): SYSTEM_OFF 0x84000008,
++ * SYSTEM_RESET 0x84000009. Only a requested halt/restart is handled here; panics keep their screen as before
++ * (kPEPanicRestartCPU etc. still return -1). Boot-arg sweetpower=0: as before.
++ */
++extern int (*PE_halt_restart)(unsigned int type);
++
++static uint64_t
++sweet_psci(uint64_t fn)
++{
++	register uint64_t x0 __asm__("x0") = fn;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : : "x4", "x5", "x6", "x7", "x8", "x9", "x10",
++	    "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	return x0;
++}
++
++static int
++sweet_halt_restart(unsigned int type)
++{
++	/* kPEHaltCPU 0, kPERestartCPU 1, kPEUPSDelayHaltCPU 3 (IOPlatformExpert.h) */
++	if (type != 0 && type != 1 && type != 3) {
++		return -1;
++	}
++	printf("SWEET POWER: %s through PSCI\n", type == 1 ? "restart" : "power off");
++	delay(100000);                  /* let the persistent log thread write the line (ufslogsecs) */
++	uint64_t r = sweet_psci(type == 1 ? 0x84000009ull : 0x84000008ull);
++	/* only reached if the firmware refused */
++	printf("SWEET POWER: PSCI %s returned %#llx\n", type == 1 ? "SYSTEM_RESET" : "SYSTEM_OFF", (unsigned long long)r);
++	return -1;
++}
++
++void sweet_power_init(void);
++void
++sweet_power_init(void)
++{
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("sweetpower", &on, sizeof(on));
++	if (on && PE_halt_restart == NULL) {
++		PE_halt_restart = sweet_halt_restart;
++		printf("SWEET POWER: shutdown and restart through PSCI\n");
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1090,6 +1090,8 @@
+ 	/* Wall clock from the PM8150 RTC + our offset file on the root (0133). */
+ 	extern void sweet_rtc_init(void);
+ 	sweet_rtc_init();
++	extern void sweet_power_init(void);
++	sweet_power_init();      /* iOS 27.2: shutdown/restart through PSCI (bsd/dev/sweet_rtc.c) */
+ 	extern void sweet_pmem_init(void);
+ 	sweet_pmem_init();       /* 0138: /dev/pmem with sweetpmem=1 (bsd/dev/sweet_pmem.c) */
+ 	extern void flame_wlan_init(void);

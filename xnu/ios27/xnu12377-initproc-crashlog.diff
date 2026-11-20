@@ -1,0 +1,48 @@
+--- research/ios27.2/kernel-backup/kern_exit.c.before-logsync	2026-11-14 06:54:52.360030266 +0000
++++ work/xnu-12377/bsd/kern/kern_exit.c	2026-11-14 07:03:36.655075778 +0000
+@@ -2031,6 +2031,13 @@
+ 
+ 	proc_crash_coredump(p);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		/* SWEET: get the console ring (launchd's last words, CRASH lines) onto the disk before the panic. */
++		extern void sweet_log_sync(uint32_t ms);
++		sweet_log_sync(3000);
++	}
++#endif
+ 	sync(p, (void *)NULL, (int *)NULL);
+ 	const uint64_t panic_options_mask = DEBUGGER_OPTION_INITPROC_PANIC | DEBUGGER_OPTION_USERSPACE_INITIATED_PANIC;
+ 
+@@ -2061,6 +2068,20 @@
+ 	task_t task = proc_task(p);
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* SWEET: launchd's crash report (registers, backtrace, heap text) before the initproc panic below. */
++	if (p == initproc && p == current_proc() && WIFSIGNALED(rv)) {
++		extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
++		sweet_crash_log(p->p_comm, proc_getpid(p), WTERMSIG(rv),
++		    ((uint64_t)ut->uu_exception << 32) | (uint32_t)ut->uu_code, ut->uu_subcode);
++		if (PROC_HAS_EXITREASON(p)) {
++			char *desc = exit_reason_get_string_desc(p->p_exit_reason);
++			printf("CRASH %s reason ns %u code 0x%llx: %s\n", p->p_comm,
++			    p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code,
++			    desc != NULL ? desc : "(none)");
++		}
++	}
++#endif
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
+ 	}
+--- research/ios27.2/kernel-backup/exception.c.before-initcrash	2026-11-14 07:03:36.641154101 +0000
++++ work/xnu-12377/osfmk/kern/exception.c	2026-11-14 07:03:36.657363779 +0000
+@@ -1059,7 +1059,7 @@
+ 	char last[96] = "";
+ 
+ 	if (!PE_parse_boot_argn("sweetscan", names, sizeof(names))) {
+-		strlcpy(names, "backboardd,SpringBoard", sizeof(names));
++		strlcpy(names, "launchd,backboardd,SpringBoard", sizeof(names));
+ 	}
+ 	size_t n = strlen(name), found = 0;
+ 	for (const char *t = names; *t;) {

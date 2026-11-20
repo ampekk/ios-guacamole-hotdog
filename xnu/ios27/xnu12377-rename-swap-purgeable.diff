@@ -1,0 +1,123 @@
+--- research/ios27.2/kernel-backup/vfs_syscalls.c.before-swap	2026-11-15 03:36:53.234652417 +0000
++++ work/xnu-12377/bsd/vfs/vfs_syscalls.c	2026-11-15 04:53:35.512702094 +0000
+@@ -10440,6 +10440,66 @@
+ 	           AT_FDCWD, uap->to, UIO_USERSPACE, 0);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * RENAME_SWAP on a filesystem without it (SWEET HFS: hfs_vnop_renamex supports only VFS_RENAME_EXCL and returns
++ * ENOTSUP). iOS 27's PosterFoundation (pf_nukeDirectoryAtURL "swap failed") and PosterKit (PRUpdatingService
++ * "relocation failed") swap directories with renamex_np(RENAME_SWAP) - APFS has it - so wallpaper extensions
++ * could never publish anything (Settings > Wallpaper spins). Done here as three exclusive renames through a
++ * temporary name next to @to:  to -> tmp, from -> to, tmp -> from,  undone step by step if one fails. Not
++ * atomic (a crash in between leaves the tmp name), which nothing here relies on. Boot-arg sweetswap=0: ENOTSUP.
++ */
++static int
++sweet_rename_swap(vfs_context_t ctx, int fromfd, user_addr_t from, int tofd, user_addr_t to, u_int flags)
++{
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("sweetswap", &on, sizeof(on));
++	if (!on) {
++		return ENOTSUP;
++	}
++	static volatile SInt32 seq;
++	char *buf = kalloc_data(3 * MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	char *f = buf, *t = buf + MAXPATHLEN, *tmp = buf + 2 * MAXPATHLEN;
++	size_t n;
++	int error = copyinstr(from, f, MAXPATHLEN, &n);
++	if (error == 0) {
++		error = copyinstr(to, t, MAXPATHLEN, &n);
++	}
++	if (error == 0) {
++		size_t tl = strlen(t);
++		while (tl > 1 && t[tl - 1] == '/') {    /* "dir/" -> "dir" */
++			t[--tl] = 0;
++		}
++		if (snprintf(tmp, MAXPATHLEN, "%s.sweetswap-%d-%u", t, proc_selfpid(), (unsigned)OSIncrementAtomic(&seq)) >=
++		    MAXPATHLEN) {
++			error = ENAMETOOLONG;
++		}
++	}
++	u_int ex = flags | RENAME_EXCL;
++	if (error == 0) {
++		error = renameat_internal(ctx, tofd, CAST_USER_ADDR_T(t), tofd, CAST_USER_ADDR_T(tmp), UIO_SYSSPACE, ex);
++	}
++	if (error == 0) {
++		error = renameat_internal(ctx, fromfd, CAST_USER_ADDR_T(f), tofd, CAST_USER_ADDR_T(t), UIO_SYSSPACE, ex);
++		if (error != 0) {
++			(void)renameat_internal(ctx, tofd, CAST_USER_ADDR_T(tmp), tofd, CAST_USER_ADDR_T(t), UIO_SYSSPACE, ex);
++		} else {
++			error = renameat_internal(ctx, tofd, CAST_USER_ADDR_T(tmp), fromfd, CAST_USER_ADDR_T(f), UIO_SYSSPACE,
++			    ex);
++			if (error != 0) {
++				(void)renameat_internal(ctx, tofd, CAST_USER_ADDR_T(t), fromfd, CAST_USER_ADDR_T(f), UIO_SYSSPACE, ex);
++				(void)renameat_internal(ctx, tofd, CAST_USER_ADDR_T(tmp), tofd, CAST_USER_ADDR_T(t), UIO_SYSSPACE, ex);
++			}
++		}
++	}
++	kfree_data(buf, 3 * MAXPATHLEN);
++	return error;
++}
++#endif
++
+ int
+ renameatx_np(__unused proc_t p, struct renameatx_np_args *uap, __unused int32_t *retval)
+ {
+@@ -10451,8 +10511,15 @@
+ 		return EINVAL;
+ 	}
+ 
+-	return renameat_internal(vfs_context_current(), uap->fromfd, uap->from,
+-	           uap->tofd, uap->to, UIO_USERSPACE, uap->flags);
++	int error = renameat_internal(vfs_context_current(), uap->fromfd, uap->from,
++	    uap->tofd, uap->to, UIO_USERSPACE, uap->flags);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (error == ENOTSUP && (uap->flags & RENAME_SWAP)) {
++		error = sweet_rename_swap(vfs_context_current(), uap->fromfd, uap->from, uap->tofd, uap->to,
++		    uap->flags & ~RENAME_SWAP);
++	}
++#endif
++	return error;
+ }
+ 
+ int
+@@ -13574,6 +13641,7 @@
+ #define SWEET_FPFS_GET_SYNCROOT         _IOR('J', 72, uint32_t)
+ #define SWEET_FPFS_GET_PARENT_SYNCROOT  _IOR('J', 74, uint64_t)
+ #define SWEET_FPFS_DIRSTAT              _IOWR('J', 32, uint8_t[40])
++#define SWEET_APFS_MARK_PURGEABLE       0xc0084a44UL    /* _IOWR('J', 68, uint64_t) */
+ /*
+  * APFS-private _IOW('J', 2, u64) on a file: LocalStorageFileProvider issues it on
+  * the placeholder Safari has it import into Downloads (DOCDownloadImportManager),
+@@ -13976,6 +14044,27 @@
+ 		    strncmp(vp->v_mount->mnt_vfsstat.f_fstypename, "hfs", MFSNAMELEN) == 0) {
+ 			error = ENOTSUP;
+ 		}
++		/*
++		 * APFSIOC_MARK_PURGEABLE (_IOWR('J', 68, uint64_t)) on HFS: accepted, the flags kept in the xattr
++		 * com.apple.sweet.purgeable (8 bytes). HFS has no purgeable files (nothing is ever purged); iOS 27's
++		 * PosterBoard treats the ENOTTY as fatal ("Error marking ... as purgable", "failed to correct file
++		 * purgable" -> createNewStoreCoordinatorWithPath fails for every wallpaper descriptor -> empty
++		 * gallery). Boot-arg sweetpurgeable=0 keeps ENOTTY.
++		 */
++		if (error == ENOTTY && cmd == SWEET_APFS_MARK_PURGEABLE && vp->v_mount != NULL &&
++		    strncmp(vp->v_mount->mnt_vfsstat.f_fstypename, "hfs", MFSNAMELEN) == 0) {
++			uint32_t on = 1;
++			(void)PE_parse_boot_argn("sweetpurgeable", &on, sizeof(on));
++			if (on) {
++				uio_t pu = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
++				if (pu != NULL) {
++					uio_addiov(pu, CAST_USER_ADDR_T(data), sizeof(uint64_t));
++					(void)vn_setxattr(vp, "com.apple.sweet.purgeable", pu, XATTR_NOSECURITY, ctx);
++					uio_free(pu);
++				}
++				error = 0;
++			}
++		}
+ #endif
+ 	}
+ 	} /* end switch stmt */

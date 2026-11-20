@@ -1,0 +1,164 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -91,6 +91,7 @@
+  * is black). The bottom band (home indicator) is not drawn, as before 0225. Boot-arg sweetfbisland=0: off.
+  */
+ static bool sweet_fb_island = true;
++static bool sweet_fb_yuv = true;       /* sweetfbyuv: draw '420v'/'420f' video layers (presentComposed) */
+ /*
+  * 0171: layer order. Subway Surfers (0170 log): layer 0 = the game's drawable (flag byte 0x467+layer = 1),
+  * layer 1 = CoreAnimation's own framebuffer surface (2/3), fully opaque or fully transparent. Drawing layer 0
+@@ -612,6 +613,9 @@
+ 	uint32_t island = 1;
+ 	(void)PE_parse_boot_argn("sweetfbisland", &island, sizeof(island));
+ 	sweet_fb_island = island != 0;
++	uint32_t yuv = 1;
++	(void)PE_parse_boot_argn("sweetfbyuv", &yuv, sizeof(yuv));
++	sweet_fb_yuv = yuv != 0;
+ 	IOLog("SWEET FB: layers persist across swaps %s (0184)\n", sweet_fb_persist ? "on" : "off");
+ 	IOLog("SWEET FB: multi-layer composition %s (0170)\n", sweet_fb_compose ? "on" : "off");
+ 	IOLog("SWEET FB: frame hand-over sync %s (0169)\n", sweet_fb_sync ? "on" : "off");
+@@ -2341,6 +2345,76 @@
+ static uint32_t sweet_fb_comp_logged;
+ 
+ /*
++ * 2026-11-17: video. iOS 27 hands decoded video (VideoToolbox -> '420v' / '420f' bi-planar YUV 4:2:0, NV12 layout:
++ * plane 0 Y, plane 1 interleaved Cb Cr at half size) to the display as its own layer, as an iPhone's display
++ * controller scans those out directly; the compositor only took BGRA and skipped it: black video with sound
++ * (Safari, local files). Here such a layer is converted to BGRA while it is drawn, scaled like any other layer,
++ * opaque. BT.709 (HD and YouTube's default), video range for '420v', full range for '420f'; fixed point x256.
++ * Boot-arg sweetfbyuv=0: skip them as before.
++ */
++#define SWEET_FB_FORMAT_420V            0x34323076u     /* '420v' */
++#define SWEET_FB_FORMAT_420F            0x34323066u     /* '420f' */
++static uint32_t sweet_fb_yuv_layers;
++
++static inline uint32_t
++sweet_fb_clamp8(int32_t v)
++{
++	return v < 0 ? 0u : v > 255 ? 255u : (uint32_t)v;
++}
++
++/* the source rectangle (sx, sy, sw, sh) of an NV12 surface, scaled into (dx, dy, dw, dh) of dst (dstW wide) */
++static bool
++sweet_fb_draw_nv12(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy, int32_t sw, int32_t sh,
++    int32_t dx, int32_t dy, int32_t dw, int32_t dh, uint32_t *dst, uint32_t dstW, uint32_t dstH, uint32_t *colx)
++{
++	if (!sweet_fb_yuv || (s->pixelFormat != SWEET_FB_FORMAT_420V && s->pixelFormat != SWEET_FB_FORMAT_420F) ||
++	    s->planeCount < 2 || s->memory == NULL || src == 0) {
++		return false;
++	}
++	const struct sweet_surface_plane *py = &s->planes[0], *pc = &s->planes[1];
++	if (py->bytesPerElement != 1 || pc->bytesPerElement != 2 || py->bytesPerRow == 0 || pc->bytesPerRow == 0 ||
++	    sx < 0 || sy < 0 || sw <= 0 || sh <= 0 || sx + sw > (int32_t)py->width || sy + sh > (int32_t)py->height ||
++	    (uint64_t)py->offset + (uint64_t)(sy + sh - 1) * py->bytesPerRow + (uint64_t)(sx + sw) > s->memory->getLength() ||
++	    (uint64_t)pc->offset + (uint64_t)((sy + sh - 1) / 2) * pc->bytesPerRow + (uint64_t)((sx + sw + 1) / 2) * 2 >
++	    s->memory->getLength()) {
++		return false;
++	}
++	bool full = s->pixelFormat == SWEET_FB_FORMAT_420F;
++	/* Y' scale and offset; chroma coefficients (BT.709) */
++	const int32_t ky = full ? 256 : 298, oy = full ? 0 : 16;
++	const int32_t rv = full ? 403 : 459, gu = full ? 48 : 55, gv = full ? 120 : 136, bu = full ? 475 : 541;
++	s->memory->performOperation(kIOMemoryIncoherentIOFlush, 0, s->memory->getLength());
++	const uint8_t *ybase = (const uint8_t *)(src + py->offset), *cbase = (const uint8_t *)(src + pc->offset);
++	int32_t x0 = dx < 0 ? 0 : dx, y0 = dy < 0 ? 0 : dy;
++	int32_t x1 = dx + dw > (int32_t)dstW ? (int32_t)dstW : dx + dw;
++	int32_t y1 = dy + dh > (int32_t)dstH ? (int32_t)dstH : dy + dh;
++	for (int32_t x = x0; x < x1; x++) {
++		colx[x] = (uint32_t)(sx + (int32_t)(((int64_t)(x - dx) * sw) / dw));
++	}
++	for (int32_t y = y0; y < y1; y++) {
++		int32_t yy = sy + (int32_t)(((int64_t)(y - dy) * sh) / dh);
++		const uint8_t *yrow = ybase + (uint64_t)yy * py->bytesPerRow;
++		const uint8_t *crow = cbase + (uint64_t)(yy / 2) * pc->bytesPerRow;
++		uint32_t *drow = dst + (uint64_t)y * dstW;
++		for (int32_t x = x0; x < x1; x++) {
++			uint32_t xx = colx[x];
++			int32_t c = ky * ((int32_t)yrow[xx] - oy) + 128;
++			int32_t u = (int32_t)crow[(xx & ~1u)] - 128, v = (int32_t)crow[(xx & ~1u) + 1] - 128;
++			uint32_t r = sweet_fb_clamp8((c + rv * v) >> 8);
++			uint32_t g = sweet_fb_clamp8((c - gu * u - gv * v) >> 8);
++			uint32_t b = sweet_fb_clamp8((c + bu * u) >> 8);
++			drow[x] = 0xff000000u | (r << 16) | (g << 8) | b;
++		}
++	}
++	if (sweet_fb_yuv_layers++ < 4) {
++		IOLog("SWEET FB: video layer: surface %u %ux%u '%c%c%c%c' (%s range) drawn at %d,%d %dx%d\n", s->id,
++		    py->width, py->height, (char)(s->pixelFormat >> 24), (char)(s->pixelFormat >> 16),
++		    (char)(s->pixelFormat >> 8), (char)s->pixelFormat, full ? "full" : "video", dx, dy, dw, dh);
++	}
++	return true;
++}
++
++/*
+  * 0170: a frame of two or more layers (or one whose source and destination sizes differ), composed in the
+  * cached fCompose from the highest layer index up (0171: the record's layer 0 is the top), then copied once into the panel memory,
+  * scaled by fColMap. False: not for this path (present() shows it).
+@@ -2382,6 +2456,44 @@
+ 		sweet_fb_comp_logged++;
+ 	}
+ 	bool first = true;
++	/*
++	 * 2026-11-17: video layers ('420v'/'420f') go underneath everything: the page above has a transparent hole
++	 * where the video shows and draws the playback controls over it (drawn on top, the video hid the controls).
++	 * The layers above are then blended even when flagged opaque.
++	 */
++	uint32_t videoMask = 0;
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS && sweet_fb_yuv; l++) {
++		uint32_t id = get32(rec, 0x54 + 4 * l);
++		if (!(mask & (1u << l)) || id == 0) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(id);
++		if (s == NULL || s == fSurface ||
++		    (s->pixelFormat != SWEET_FB_FORMAT_420V && s->pixelFormat != SWEET_FB_FORMAT_420F)) {
++			OSSafeReleaseNULL(s);
++			continue;
++		}
++		const uint8_t *a = rec + 0x64 + 16 * l, *b = rec + 0xc4 + 16 * l;
++		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++		int32_t sw = (int32_t)get32(a, 8), sh = (int32_t)get32(a, 12);
++		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
++		int32_t dw = (int32_t)get32(b, 8), dh = (int32_t)get32(b, 12);
++		if (sw <= 0 || sh <= 0) {
++			sw = (int32_t)s->width;
++			sh = (int32_t)s->height;
++		}
++		if (dw <= 0 || dh <= 0) {
++			dw = sw;
++			dh = sh;
++		}
++		if (sweet_fb_draw_nv12(s, s->kernelAddress(), sx, sy, sw, sh, dx, dy, dw, dh, fCompose, fLogicalW,
++		    fLogicalH, fComposeX)) {
++			videoMask |= 1u << l;
++			sweet_fb_stats.comp_opaque++;
++			first = false;
++		}
++		OSSafeReleaseNULL(s);
++	}
+ 	for (uint32_t n = 0; n < SWEET_FB_LAYERS; n++) {
+ 		/* 0185: drawn bottom first: layer 0 first when the higher index is on top (0171: the reverse) */
+ 		uint32_t l = sweet_fb_high_on_top ? n : SWEET_FB_LAYERS - 1 - n;
+@@ -2404,6 +2516,10 @@
+ 			dw = sw;
+ 			dh = sh;
+ 		}
++		if (videoMask & (1u << l)) {
++			OSSafeReleaseNULL(s);          /* drawn first, underneath (above) */
++			continue;
++		}
+ 		bool ok = s != NULL && s != fSurface && src != 0 && s->memory != NULL && s->elementWidth == 1 &&
+ 		    s->elementHeight == 1 && (s->bytesPerElement == 4 || s->bytesPerElement == 0) && sx >= 0 && sy >= 0 &&
+ 		    sw > 0 && sh > 0 && sx + sw <= (int32_t)s->width && sy + sh <= (int32_t)s->height &&
+@@ -2415,8 +2531,8 @@
+ 			const uint8_t *base = (const uint8_t *)(src + s->offset);
+ 			sweet_fb_alpha_samples(base, s->bytesPerRow, sx, sy, sw, sh, &zero, &full, &part);
+ 			/* 0172: a layer flagged opaque is copied, its alpha ignored */
+-			bool flagged = sweet_fb_opaque_flag && rec[0x467 + l] != 0;
+-			blend = !first && !flagged && full != 64;
++			bool flagged = sweet_fb_opaque_flag && rec[0x467 + l] != 0 && videoMask == 0;
++			blend = !first && !flagged && (full != 64 || videoMask != 0);   /* over video: always per pixel */
+ 			if (!first && !flagged && zero == 64) {
+ 				/* 0185: an upper layer with nothing visible is left out (0170 drew it opaque: black) */
+ 				sweet_fb_stats.comp_skipped++;

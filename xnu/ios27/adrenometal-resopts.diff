@@ -1,0 +1,66 @@
+--- research/ios27.2/kernel-backup/NativeBridgeMetalFrontend.mm.before-resopts	2026-11-15 06:34:02.738244215 +0000
++++ work/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm	2026-11-15 06:34:10.621969459 +0000
+@@ -569,6 +569,8 @@
+ // the status rows (noteProblem) are kept either way. A line goes to the system log as a public string: NSLog's object arguments are
+ // stored redacted on macOS 27 (every line of a refusal's text read "<private>" in the log archive).
+ static bool logGpuOn() {static const bool on=getenv("SHENG_LOG_GPU")!=nullptr;return on;}
++// The MTLResourceOptions fields the runtime knows (CPU cache mode, storage mode, hazard tracking); newer SDKs add bits above them.
++static const uint64_t kNBDefinedResourceOptions=0x3ff;
+ #define GLOG(...) do{if(logGpuOn()){NSString *glogText=[NSString stringWithFormat:__VA_ARGS__];\
+  os_log(OS_LOG_DEFAULT,"%{public}s",glogText.UTF8String?:"?");}}while(0)
+ #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];GLOG(@"%@",nbText);noteProblem(nbText);\
+@@ -1336,7 +1338,7 @@
+ }
+ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
+  if(!d)return false;
+- *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions,
++ *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions&kNBDefinedResourceOptions,
+        textureRotation(d),textureFlag(d,"framebufferOnly"),textureFlag(d,"isDrawable"),packedSwizzle(d.swizzle)};
+  if(singleSample() && out->samples>1) {
+   out->samples=1;
+@@ -4187,7 +4189,7 @@
+  return notePurgeable(2,nmb_heap_set_purgeable_state(_handle,state),state,[self size],_purgeCounted,"heap");
+ }
+ - (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {
+- NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
++ NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options&kNBDefinedResourceOptions,offset);
+  if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
+  buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
+@@ -4411,7 +4413,10 @@
+ }
+ - (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)d {
+  if(!d)return nil;
+- NmbHeap *handle=nmb_heap_new(gDevice,d.type,d.size,(uint64_t)d.resourceOptions);
++ // iOS 27.2 clients set MTLResourceOptions bits the runtime has no value for (QuartzCore/SpringBoard heaps: 0x600200, i.e. bits 21
++ // and 22 beside HazardTrackingModeTracked), and its from_raw refused the whole heap (62x per boot, "UndefinedValue raw 6291968").
++ // Only the defined fields go down (CPU cache 0xf, storage 0xf0, hazard tracking 0x300); the heap keeps the caller's value.
++ NmbHeap *handle=nmb_heap_new(gDevice,d.type,d.size,(uint64_t)d.resourceOptions&kNBDefinedResourceOptions);
+  if(!handle){NBLOG(@"native-metal: heap refused: %@",lastError());return nil;}
+  NBHeap *heap=[NBHeap new];heap.handle=handle;heap.options=d.resourceOptions;heap.heapType=d.type;return (id<MTLHeap>)heap;
+ }
+@@ -4424,7 +4429,7 @@
+ }
+ - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+  uint64_t answer[2]={0,0};
+- if(!nmb_device_heap_buffer_size_and_align(gDevice,length,(uint64_t)options,answer))NBLOG(@"native-metal: heap buffer size refused: %@",lastError());
++ if(!nmb_device_heap_buffer_size_and_align(gDevice,length,(uint64_t)options&kNBDefinedResourceOptions,answer))NBLOG(@"native-metal: heap buffer size refused: %@",lastError());
+  return (MTLSizeAndAlign){answer[0],answer[1]};
+ }
+ - (id)newResourceGroupFromResources:(const id __unsafe_unretained [])resources count:(NSUInteger)count {
+@@ -4465,13 +4470,13 @@
+  NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
+ }
+ - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+- NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
++ NmbBuffer *handle=nmb_buffer_new(gDevice,length,options&kNBDefinedResourceOptions,nullptr);
+  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
+  if(!bytes)return nil;
+- NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,bytes);
++ NmbBuffer *handle=nmb_buffer_new(gDevice,length,options&kNBDefinedResourceOptions,bytes);
+  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
+ }

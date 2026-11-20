@@ -1,0 +1,118 @@
+--- ../../research/ios27.2/kernel-backup/SweetFramebuffer.cpp.before-asyncflip	2026-11-17 02:59:16.263801485 +0000
++++ iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-17 02:59:16.276054441 +0000
+@@ -378,8 +378,10 @@
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
++	IOTimerEventSource *fFlipTimer;         /* 2026-11-17: drives page flips and the frame waiting for one */
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void flipFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -567,6 +569,10 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++	fFlipTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::flipFired);
++	if (fFlipTimer != NULL && fWorkLoop->addEventSource(fFlipTimer) != kIOReturnSuccess) {
++		OSSafeReleaseNULL(fFlipTimer);
++	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	uint32_t vsyncHz = 60;
+@@ -849,6 +855,59 @@
+ 	}
+ }
+ 
++/*
++ * 2026-11-17 async flip: every 0.5 ms while a flip is outstanding. Programs it once the blit's fence has passed, notices
++ * when the display took it, and then shows the frame that came in meanwhile (the latest swap, fDirty), as the swap
++ * itself would have. Runs on the work loop, like vsyncFired.
++ */
++void
++AppleCLCD::flipFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	if (!sweet_fbflip.ok || fb->fPresentLock == NULL) {
++		return;
++	}
++	if (!IOLockTryLock(fb->fPresentLock)) {
++		sender->setTimeoutUS(500);
++		return;
++	}
++	bool settled = fbflip_settled();
++	IOLockUnlock(fb->fPresentLock);
++	if (!settled) {
++		sender->setTimeoutUS(500);
++		return;
++	}
++	uint8_t *rec = NULL;
++	IOLockLock(fb->fLock);
++	if (fb->fDirty && !fb->fPowerOff && sweet_fb_metal) {
++		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++		if (rec != NULL) {
++			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++		}
++	}
++	IOLockUnlock(fb->fLock);
++	if (rec == NULL) {
++		return;
++	}
++	int shown = 0;
++	if (IOLockTryLock(fb->fPresentLock)) {
++		shown = fb->presentGPU(rec);           /* re-arms this timer itself when it has to wait again */
++		IOLockUnlock(fb->fPresentLock);
++	} else {
++		sender->setTimeoutUS(500);
++	}
++	if (shown > 0) {
++		sweet_fb_stats.at_swap++;
++		IOLockLock(fb->fLock);
++		if (memcmp(fb->fPending, rec, SWEET_FB_SWAP_REC_SIZE) == 0) {
++			fb->fDirty = false;
++		}
++		IOLockUnlock(fb->fLock);
++		fb->shown(rec);
++	}
++	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -1900,9 +1959,20 @@
+ 		return 0;
+ 	}
+ 	fbflip_setup(fPhys, fRowBytes, (uint64_t)fRowBytes * fHeight, fPixels);
+-	if (!fbflip_wait(20)) {
+-		sweet_fbflip.busy++;                    /* the last frame is not on the panel yet: next vsync */
+-		return -1;
++	/*
++	 * 2026-11-17 (async flip): the previous frame not on the panel yet no longer blocks the swap (up to 20 ms of
++	 * CoreAnimation's render thread, mostly waiting for the panel's next frame start, while the GPU sat idle: 55-63%
++	 * busy at 22-29 fps). The frame stays pending (fDirty) and flipFired presents it the moment the flip is taken.
++	 */
++	if (!fbflip_settled()) {
++		sweet_fbflip.busy++;
++		if (fFlipTimer != NULL) {
++			fFlipTimer->setTimeoutUS(500);
++			return -1;
++		}
++		if (!fbflip_wait(20)) {
++			return -1;
++		}
+ 	}
+ 	pauseConsole();
+ 	/* 0171: the lowest index is the top layer. 0172: up to two layers, the top one opaque */
+@@ -2207,6 +2277,9 @@
+ 	if (sweet_fbflip.ok) {
+ 		sweet_fbflip.pending = 1u + (sweet_fbflip.front ^ 1u);  /* shown once the blit is done (fbflip_settled) */
+ 		sweet_fbflip.pending_fence = fence;
++		if (fFlipTimer != NULL) {
++			fFlipTimer->setTimeoutUS(500);  /* program the flip as soon as the blit is done, not at the next tick */
++		}
+ 	}
+ 	if (layers > 1) {
+ 		sweet_fb_stats.top_only++;

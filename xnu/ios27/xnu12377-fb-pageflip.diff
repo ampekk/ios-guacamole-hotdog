@@ -1,0 +1,271 @@
+--- ../../research/ios27.2/kernel-backup/SweetFramebuffer.cpp.before-flip	2026-11-17 02:25:54.131509303 +0000
++++ iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-17 02:26:39.804862951 +0000
+@@ -692,6 +692,134 @@
+ 
+ /* Read-only probe of the physical framebuffer scanned by the panel. Five bands,
+  * each four full-width rows; run once a second only when explicitly enabled. */
++/*
++ * 2026-11-17 page flip. The panel (DSI command mode) is refreshed from ONE buffer, ABL's splash at 0x9c000000, which the
++ * display controller re-reads on every TE (INTF1 autorefresh, 59.86 Hz); the GPU present wrote CoreAnimation's frame
++ * into that same buffer whenever a swap came, and its writes leave the colour cache 64 bytes at a time over a few
++ * milliseconds, so a refresh taken meanwhile sent the panel a scatter of old and new lines (user photos 11-17: dashes
++ * and trails where things move; iOS screenshots of the same moments are clean). Now two buffers: the blit goes into
++ * the one the pipes do not read, and once its fence has passed the two source pipes are pointed at it (VIG0 feeds LM0,
++ * the left 720 columns; VIG1 feeds LM1 with SRC_XY 720: scanprobe 11-17, both SRC0_ADDR 0x9c000000, stride 5760),
++ * CTL0 FLUSH bits 0|1, which the controller takes at the next frame start (FLUSH reads 0 again then). A buffer is
++ * written again only after the flip away from it was taken. The second buffer is 18 MB into ABL's 36 MB cont-splash
++ * region (msmnile: 0x9c000000 + 0x2400000), which XNU does not use (its RAM is the high bank) and which the display
++ * already reads from (the DSI packet buffer at 0x9d124000 lies past the first frame). CPU paths (compose, present,
++ * the power-off clear) still write the first buffer: they flip back to it first.
++ * Boot-arg sweetfbflip=0: one buffer, as before.
++ */
++#define FBFLIP_MDP_PA           0x0ae00000ull   /* MDSS; the MDP block is at +0x1000 */
++#define FBFLIP_MDP_BYTES        0x8000u
++#define FBFLIP_CTL0_LAYER0      0x2000u
++#define FBFLIP_CTL0_LAYER1      0x2004u
++#define FBFLIP_CTL0_FLUSH       0x2018u
++#define FBFLIP_VIG0             0x5000u
++#define FBFLIP_VIG1             0x7000u
++#define FBFLIP_SRC0_ADDR        0x014u
++#define FBFLIP_YSTRIDE0         0x024u
++#define FBFLIP_FLUSH_BITS       0x3u            /* VIG0 | VIG1 */
++#define FBFLIP_SECOND           0x1200000ull
++
++static struct {
++	bool tried, ok;
++	volatile uint32_t *mdp;
++	uint64_t pa[2];
++	unsigned front;                 /* the buffer the pipes read (once taken) */
++	unsigned pending;               /* 1 + the buffer to flip to once pending_fence passes; 0: none */
++	uint32_t pending_fence;
++	bool latching;                  /* flip written, FLUSH bits not yet taken */
++	uint32_t flips, busy, cpu_back, slow;
++} sweet_fbflip;
++
++static inline uint32_t
++fbflip_rd(uint32_t off)
++{
++	return sweet_fbflip.mdp[off / 4];
++}
++
++static inline void
++fbflip_wr(uint32_t off, uint32_t v)
++{
++	sweet_fbflip.mdp[off / 4] = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++fbflip_program(unsigned b)
++{
++	fbflip_wr(FBFLIP_VIG0 + FBFLIP_SRC0_ADDR, (uint32_t)sweet_fbflip.pa[b]);
++	fbflip_wr(FBFLIP_VIG1 + FBFLIP_SRC0_ADDR, (uint32_t)sweet_fbflip.pa[b]);
++	fbflip_wr(FBFLIP_CTL0_FLUSH, FBFLIP_FLUSH_BITS);
++	sweet_fbflip.front = b;
++	sweet_fbflip.latching = true;
++	sweet_fbflip.flips++;
++}
++
++/* Advance: program a flip whose blit has finished, notice a flip taken. True when nothing is outstanding. */
++static bool
++fbflip_settled(void)
++{
++	if (!sweet_fbflip.ok) {
++		return true;
++	}
++	if (sweet_fbflip.pending != 0) {
++		if (sweet_gpu_wait_fence_ns(sweet_fbflip.pending_fence, 0) != 0) {
++			return false;
++		}
++		fbflip_program(sweet_fbflip.pending - 1);
++		sweet_fbflip.pending = 0;
++	}
++	if (sweet_fbflip.latching) {
++		if (fbflip_rd(FBFLIP_CTL0_FLUSH) & FBFLIP_FLUSH_BITS) {
++			return false;
++		}
++		sweet_fbflip.latching = false;
++	}
++	return true;
++}
++
++/*
++ * Up to ms milliseconds for the last flip to be programmed and taken (polling: a nonzero fence timeout would count as a
++ * hang). Called before a blit into the other buffer: the swap waits for the previous frame to reach the panel, as a
++ * double-buffered swap does, instead of leaving it to the next vsync tick (which halved the frame rate).
++ */
++static bool
++fbflip_wait(unsigned ms)
++{
++	for (unsigned i = 0; i < ms; i++) {
++		if (fbflip_settled()) {
++			return true;
++		}
++		IOSleep(1);
++	}
++	return fbflip_settled();
++}
++
++/* Before the CPU writes the panel (it writes the first buffer): everything settled, the pipes back on buffer 0. */
++static void
++fbflip_for_cpu(void)
++{
++	if (!sweet_fbflip.ok) {
++		return;
++	}
++	for (int i = 0; i < 100 && !fbflip_settled(); i++) {
++		IODelay(1000);
++	}
++	if (sweet_fbflip.pending != 0 || sweet_fbflip.latching) {
++		sweet_fbflip.slow++;
++		sweet_fbflip.pending = 0;
++	}
++	if (sweet_fbflip.front != 0) {
++		fbflip_program(0);
++		for (int i = 0; i < 50 && (fbflip_rd(FBFLIP_CTL0_FLUSH) & FBFLIP_FLUSH_BITS); i++) {
++			IODelay(1000);
++		}
++		sweet_fbflip.latching = false;
++		sweet_fbflip.cpu_back++;
++	}
++}
++
++static void fbflip_setup(uint64_t panel_pa, uint32_t row_bytes, uint64_t panel_bytes, uintptr_t panel_cpu);
++
+ static void
+ sweet_fb_scanout_sample(AppleCLCD *fb, uint64_t tick)
+ {
+@@ -727,6 +855,10 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if (sweet_fbflip.ok && fb->fPresentLock != NULL && IOLockTryLock(fb->fPresentLock)) {
++		(void)fbflip_settled();                 /* a finished blit's flip goes in now, taken at the next frame */
++		IOLockUnlock(fb->fPresentLock);
++	}
+ 	sweet_fb_scanout_sample(fb, count);
+ 	if (sweet_fb_stats.window_start == 0) {
+ 		sweet_fb_stats.window_start = now;
+@@ -787,6 +919,11 @@
+ 			if (sweet_fb_stats.persisted != 0) {
+ 				IOLog("SWEET FB: 5s: swaps that kept an earlier layer: %u\n", sweet_fb_stats.persisted);
+ 			}
++			if (sweet_fbflip.ok) {
++				IOLog("SWEET FB: 5s: page flips %u, frames that waited for a flip %u, back to buffer 0 for the CPU %u, slow %u\n",
++				    sweet_fbflip.flips, sweet_fbflip.busy, sweet_fbflip.cpu_back, sweet_fbflip.slow);
++				sweet_fbflip.flips = sweet_fbflip.busy = sweet_fbflip.cpu_back = sweet_fbflip.slow = 0;
++			}
+ 			if (sweet_fb_stats.top_only != 0) {
+ 				IOLog("SWEET FB: 5s: multi-layer frames shown on the GPU (opaque top layer, bottom layer around it): %u\n",
+ 				    sweet_fb_stats.top_only);
+@@ -836,6 +973,7 @@
+ 			if (fb->fPresentLock != NULL) {
+ 				IOLockLock(fb->fPresentLock);
+ 			}
++			fbflip_for_cpu();
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				bzero((void *)(fb->fPixels + (uint64_t)y * fb->fRowBytes), (size_t)fb->fWidth * 4);
+ 			}
+@@ -895,6 +1033,11 @@
+ 			if (sweet_fb_metal) {
+ 				sweet_fb_stats.cpu_metal++;
+ 			}
++			if (sweet_fbflip.ok && fb->fPresentLock != NULL) {
++				IOLockLock(fb->fPresentLock);
++				fbflip_for_cpu();               /* the CPU writes buffer 0: show buffer 0 */
++				IOLockUnlock(fb->fPresentLock);
++			}
+ 			if (!fb->presentComposed(rec)) {        /* 0170 */
+ 				fb->present(rec);
+ 			}
+@@ -1297,6 +1440,58 @@
+ 	return true;            /* md and map stay for good */
+ }
+ 
++static void
++fbflip_setup(uint64_t panel_pa, uint32_t row_bytes, uint64_t panel_bytes, uintptr_t panel_cpu)
++{
++	if (sweet_fbflip.tried) {
++		return;
++	}
++	sweet_fbflip.tried = true;
++	uint32_t on = 1;
++	(void)PE_parse_boot_argn("sweetfbflip", &on, sizeof(on));
++	if (!on) {
++		IOLog("SWEET FB: page flip off (sweetfbflip=0): one panel buffer\n");
++		return;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(FBFLIP_MDP_PA, FBFLIP_MDP_BYTES, kIODirectionInOut);
++	IOMemoryMap *map = md != NULL ? md->map(kIOMapInhibitCache) : NULL;
++	if (map == NULL) {
++		IOLog("SWEET FB: page flip: display controller not mapped\n");
++		OSSafeReleaseNULL(md);
++		return;
++	}
++	sweet_fbflip.mdp = (volatile uint32_t *)map->getVirtualAddress();
++	uint32_t ver = fbflip_rd(0), l0 = fbflip_rd(FBFLIP_CTL0_LAYER0), l1 = fbflip_rd(FBFLIP_CTL0_LAYER1);
++	uint32_t a0 = fbflip_rd(FBFLIP_VIG0 + FBFLIP_SRC0_ADDR), a1 = fbflip_rd(FBFLIP_VIG1 + FBFLIP_SRC0_ADDR);
++	uint32_t s0 = fbflip_rd(FBFLIP_VIG0 + FBFLIP_YSTRIDE0), s1 = fbflip_rd(FBFLIP_VIG1 + FBFLIP_YSTRIDE0);
++	if ((ver >> 28) != 5 || l0 != 0x01000005u || l1 != 0x01000028u || a0 != (uint32_t)panel_pa ||
++	    a1 != (uint32_t)panel_pa || panel_pa >> 32 || s0 != row_bytes || s1 != row_bytes ||
++	    round_page_64(panel_bytes) > FBFLIP_SECOND ||
++	    FBGPU_PANEL_OFF + FBFLIP_SECOND + round_page_64(panel_bytes) > FBGPU_SLOT_OFF) {
++		IOLog("SWEET FB: page flip: display not as probed (MDSS %08x, LAYER %08x %08x, SRC0 %08x %08x, stride %u %u): "
++		    "one panel buffer\n", ver, l0, l1, a0, a1, s0, s1);
++		return;         /* the map stays: harmless */
++	}
++	uint64_t second = panel_pa + FBFLIP_SECOND;
++	IOMemoryDescriptor *smd = IOMemoryDescriptor::withPhysicalAddress(second, round_page_64(panel_bytes), kIODirectionInOut);
++	IOMemoryMap *smap = smd != NULL ? smd->map(kIOMapWriteCombineCache) : NULL;
++	if (smap == NULL || !fbgpu_map_contig(sweet_fbgpu.win + FBGPU_PANEL_OFF + FBFLIP_SECOND, second, round_page_64(panel_bytes))) {
++		IOLog("SWEET FB: page flip: second buffer at %#llx not mapped: one panel buffer\n", second);
++		OSSafeReleaseNULL(smap);
++		OSSafeReleaseNULL(smd);
++		return;
++	}
++	/* the second buffer starts as a copy of what is shown, for any part a later frame does not cover */
++	memcpy((void *)smap->getVirtualAddress(), (const void *)panel_cpu, (size_t)panel_bytes);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	sweet_fbflip.pa[0] = panel_pa;
++	sweet_fbflip.pa[1] = second;
++	sweet_fbflip.front = 0;
++	sweet_fbflip.ok = true;
++	IOLog("SWEET FB: page flip on: buffers %#llx and %#llx (%llu KB), pipes VIG0/VIG1, CTL0 flush %#x\n",
++	    panel_pa, second, panel_bytes >> 10, FBFLIP_FLUSH_BITS);
++}
++
+ /*
+  * The slot holding this surface (mapped now if it is new): the GPU VA of its byte 0, or 0. A slot is
+  * remapped only while no blit of ours is queued (busy: *busy, the frame waits a vsync).
+@@ -1704,6 +1899,11 @@
+ 		sweet_fb_stats.gpu_skip[0]++;           /* 0169: why a Metal frame took the CPU path */
+ 		return 0;
+ 	}
++	fbflip_setup(fPhys, fRowBytes, (uint64_t)fRowBytes * fHeight, fPixels);
++	if (!fbflip_wait(20)) {
++		sweet_fbflip.busy++;                    /* the last frame is not on the panel yet: next vsync */
++		return -1;
++	}
+ 	pauseConsole();
+ 	/* 0171: the lowest index is the top layer. 0172: up to two layers, the top one opaque */
+ 	uint32_t mask = get32(rec, 0x104), order[SWEET_FB_LAYERS], layers = 0;
+@@ -1930,7 +2130,7 @@
+ 		sweet_fb_stats.gpu_skip[4]++;
+ 		return 0;
+ 	}
+-	uint64_t dst = sweet_fbgpu.win + FBGPU_PANEL_OFF;
++	uint64_t dst = sweet_fbgpu.win + FBGPU_PANEL_OFF + (sweet_fbflip.ok ? (uint64_t)(sweet_fbflip.front ^ 1u) * FBFLIP_SECOND : 0);
+ 	uint64_t border = sweet_fbgpu.win + 2 * FBGPU_IB_BYTES, ts = border + 0x100;
+ 	uint32_t *dw = sweet_fbgpu.ib[k], n = 0;
+ #define EV(e)           do { dw[n++] = fbgpu_pkt7(0x46, 1); dw[n++] = (e); } while (0)
+@@ -2004,6 +2204,10 @@
+ 	}
+ 	sweet_fbgpu.fence[k] = fence;
+ 	sweet_fbgpu.next = k ^ 1;
++	if (sweet_fbflip.ok) {
++		sweet_fbflip.pending = 1u + (sweet_fbflip.front ^ 1u);  /* shown once the blit is done (fbflip_settled) */
++		sweet_fbflip.pending_fence = fence;
++	}
+ 	if (layers > 1) {
+ 		sweet_fb_stats.top_only++;
+ 	}

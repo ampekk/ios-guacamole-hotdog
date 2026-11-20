@@ -1,0 +1,2397 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 884870f..ede6dad 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/sweet_rtc.c			standard
+ bsd/dev/sweet_btuart.c			standard
+ bsd/dev/sweet_haptic.c			standard
+ bsd/dev/sweet_camhw.c			standard
++bsd/dev/sweet_passcode.c		standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_passcode.c b/bsd/dev/sweet_passcode.c
+new file mode 100644
+index 0000000..01b3d7f
+--- /dev/null
++++ b/bsd/dev/sweet_passcode.c
+@@ -0,0 +1,861 @@
++/*
++ * redfin 1195: device passcode for SweetKeyStore (AppleKeyStore) and SweetACM.
++ * Design: logs/research/passcode-acm-design-2026-11-18.md.
++ *
++ * DESIGN LIMIT: the passcode is an authentication gate for the UI / ACM / Touch ID, never an encryption key.
++ * Nothing is encrypted with it and no data is made unavailable: the kernel's file layer never sees a lock
++ * (no cp_key_store_action), keychain wrap/unwrap ignore the lock state, and "unlocked since boot" is always
++ * reported. "Locked" is only what the AKS lock-state selectors tell userland.
++ *
++ * kern.sweet_passcode (root, default 0): 0 = today's behaviour exactly (the stored verifier is not read);
++ * 1 = passcode + UI lock state; 2 = passcode, never reported locked; 3 = like 1, locked at boot.
++ * Boot-arg sweetpasscode=N sets it at boot; sweetpasscode=0 pins it off for the boot (writes refused).
++ * kern.sweet_passcode_reset=1 (root) stores "no passcode". kern.sweet_passcode_state (RO).
++ *
++ * Verifier: /var/local/passcode.v1 (root 0600), one line
++ *   "SWPC1 <iter> <salt hex> <PBKDF2-HMAC-SHA256 hex>\n" or "SWPC1 none\n".
++ * The passcode itself is never stored and never logged (only its length).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <sys/kernel.h>
++#include <sys/sysctl.h>
++#include <sys/proc.h>
++#include <sys/random.h>
++#include <sys/uio.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
++
++extern void sweet_acm_publish(void);            /* SweetACM.cpp */
++extern void sweet_aks_notify(void);             /* SweetKeyStore.cpp (1196) */
++extern int sweet_acm_resolve_secret(uint8_t *buf, uint32_t *len, uint32_t cap, int *ctxno);   /* SweetACM.cpp */
++
++int sweet_pc_mode(void);
++int sweet_pc_is_set(void);
++void sweet_pc_aks_state(uint32_t *ss, uint32_t *sls, uint32_t *sfa, uint32_t *sb);
++int sweet_pc_check_user(uint64_t uaddr, uint32_t len, int unlock);
++int sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock);
++int sweet_pc_change_user(uint64_t old_ua, uint32_t old_len, uint64_t new_ua, uint32_t new_len);
++int sweet_pc_verify_packed_user(uint64_t ua, uint32_t len);
++void sweet_pc_lock(void);
++int sweet_pc_locked(void);
++void sweet_pc_hkdf32(const uint8_t *ikm, uint32_t ikml, const uint8_t *salt, uint32_t saltl, const uint8_t *info,
++    uint32_t infol, uint8_t out[32]);
++
++#define SAY(fmt, ...)   printf("SWEET PASSCODE: " fmt, ##__VA_ARGS__)
++/* guacamole (iOS 27): straight in /var/local (root-owned, always there): this kernel has no sweet_vfs_mkdir */
++#define PC_DIR          "/var/local"
++#define PC_FILE         PC_DIR "/passcode.v1"
++#define PC_ITER         100000
++#define PC_ITER_MIN     1000
++#define PC_ITER_MAX     10000000
++#define PC_SALT         16
++#define PC_DK           32
++#define PC_MAXLEN       128
++#define PC_FREE_FAILS   5
++#define PC_BACKOFF_MAX  900
++
++enum { ST_UNKNOWN = 0, ST_NONE, ST_SET, ST_BAD };
++
++static LCK_GRP_DECLARE(sweet_pc_grp, "sweet_passcode");
++static LCK_MTX_DECLARE(sweet_pc_lck, &sweet_pc_grp);
++
++static int pc_inited, pc_mode, pc_pinned;
++static int pc_stored = ST_UNKNOWN;
++static uint32_t pc_iter;
++static uint8_t pc_salt[PC_SALT], pc_dk[PC_DK];
++static int pc_locked, pc_lock_at_load = 1;      /* mode 3: the first load after boot starts locked */
++static uint32_t pc_fails;
++static clock_sec_t pc_last_try, pc_backoff_until;
++static uint32_t pc_n_ok, pc_n_bad, pc_n_busy;
++static int pc_unlocked_event;                 /* 1196: set under the lock, sent after it */
++
++static clock_sec_t
++pc_now(void)
++{
++	clock_sec_t s;
++	clock_usec_t us;
++	clock_get_system_microtime(&s, &us);
++	return s;
++}
++
++/* 1196: tell MobileKeyBag clients (SpringBoard) that the keybag state changed. Never with the lock held. */
++static uint32_t pc_n_notify;
++static void
++pc_notify(const char *why)
++{
++	pc_n_notify++;
++	SAY("keybag status event (%s)\n", why);
++	sweet_aks_notify();
++}
++
++static void
++pc_init(void)
++{
++	if (pc_inited) {
++		return;
++	}
++	int v = 0;
++	if (PE_parse_boot_argn("sweetpasscode", &v, sizeof(v))) {
++		if (v < 0 || v > 3) {
++			v = 0;
++		}
++		pc_mode = v;
++		pc_pinned = (v == 0);
++	}
++	pc_inited = 1;
++	SAY("mode %d%s (boot)\n", pc_mode, pc_pinned ? " pinned by boot-arg sweetpasscode=0" : "");
++}
++
++/* ---- SHA-256 / HMAC / PBKDF2 (self-contained: no corecrypto on SWEET) ---- */
++typedef struct {
++	uint32_t h[8];
++	uint64_t n;
++	uint8_t b[64];
++	uint32_t bl;
++} pc_sha;
++
++static const uint32_t pc_k[64] = {
++	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++};
++
++#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
++
++static void
++pc_sha_block(uint32_t *h, const uint8_t *p)
++{
++	uint32_t w[64], a, b, c, d, e, f, g, hh;
++	for (int i = 0; i < 16; i++) {
++		w[i] = ((uint32_t)p[4 * i] << 24) | ((uint32_t)p[4 * i + 1] << 16) | ((uint32_t)p[4 * i + 2] << 8) | p[4 * i + 3];
++	}
++	for (int i = 16; i < 64; i++) {
++		uint32_t s0 = ROR(w[i - 15], 7) ^ ROR(w[i - 15], 18) ^ (w[i - 15] >> 3);
++		uint32_t s1 = ROR(w[i - 2], 17) ^ ROR(w[i - 2], 19) ^ (w[i - 2] >> 10);
++		w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++	}
++	a = h[0]; b = h[1]; c = h[2]; d = h[3]; e = h[4]; f = h[5]; g = h[6]; hh = h[7];
++	for (int i = 0; i < 64; i++) {
++		uint32_t t1 = hh + (ROR(e, 6) ^ ROR(e, 11) ^ ROR(e, 25)) + ((e & f) ^ (~e & g)) + pc_k[i] + w[i];
++		uint32_t t2 = (ROR(a, 2) ^ ROR(a, 13) ^ ROR(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
++		hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
++	}
++	h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
++}
++
++static void
++pc_sha_init(pc_sha *s)
++{
++	static const uint32_t iv[8] = {
++		0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
++	};
++	memcpy(s->h, iv, sizeof(iv));
++	s->n = 0;
++	s->bl = 0;
++}
++
++static void
++pc_sha_update(pc_sha *s, const uint8_t *p, size_t len)
++{
++	s->n += len;
++	while (len > 0) {
++		uint32_t k = 64 - s->bl;
++		if (k > len) {
++			k = (uint32_t)len;
++		}
++		memcpy(s->b + s->bl, p, k);
++		s->bl += k;
++		p += k;
++		len -= k;
++		if (s->bl == 64) {
++			pc_sha_block(s->h, s->b);
++			s->bl = 0;
++		}
++	}
++}
++
++static void
++pc_sha_final(pc_sha *s, uint8_t out[32])
++{
++	uint64_t bits = s->n * 8;
++	uint8_t pad = 0x80, z = 0, l[8];
++	pc_sha_update(s, &pad, 1);
++	while (s->bl != 56) {
++		pc_sha_update(s, &z, 1);
++	}
++	for (int i = 0; i < 8; i++) {
++		l[i] = (uint8_t)(bits >> (56 - 8 * i));
++	}
++	pc_sha_update(s, l, 8);
++	for (int i = 0; i < 8; i++) {
++		out[4 * i] = (uint8_t)(s->h[i] >> 24);
++		out[4 * i + 1] = (uint8_t)(s->h[i] >> 16);
++		out[4 * i + 2] = (uint8_t)(s->h[i] >> 8);
++		out[4 * i + 3] = (uint8_t)s->h[i];
++	}
++}
++
++/* PBKDF2-HMAC-SHA256, one 32-byte block (dkLen 32). */
++static void
++pc_pbkdf2(const uint8_t *pw, uint32_t pwlen, const uint8_t *salt, uint32_t saltlen, uint32_t iter,
++    uint8_t out[PC_DK])
++{
++	uint8_t key[64], ipad[64], opad[64], u[32], t[32];
++	pc_sha in0, out0, s;
++	memset(key, 0, sizeof(key));
++	if (pwlen > 64) {
++		pc_sha_init(&s);
++		pc_sha_update(&s, pw, pwlen);
++		pc_sha_final(&s, key);
++	} else {
++		memcpy(key, pw, pwlen);
++	}
++	for (int i = 0; i < 64; i++) {
++		ipad[i] = key[i] ^ 0x36;
++		opad[i] = key[i] ^ 0x5c;
++	}
++	pc_sha_init(&in0);
++	pc_sha_update(&in0, ipad, 64);
++	pc_sha_init(&out0);
++	pc_sha_update(&out0, opad, 64);
++	/* U1 = HMAC(P, salt || INT(1)) */
++	static const uint8_t one[4] = { 0, 0, 0, 1 };
++	s = in0;
++	pc_sha_update(&s, salt, saltlen);
++	pc_sha_update(&s, one, 4);
++	pc_sha_final(&s, u);
++	s = out0;
++	pc_sha_update(&s, u, 32);
++	pc_sha_final(&s, u);
++	memcpy(t, u, 32);
++	for (uint32_t i = 1; i < iter; i++) {
++		s = in0;
++		pc_sha_update(&s, u, 32);
++		pc_sha_final(&s, u);
++		s = out0;
++		pc_sha_update(&s, u, 32);
++		pc_sha_final(&s, u);
++		for (int j = 0; j < 32; j++) {
++			t[j] ^= u[j];
++		}
++	}
++	memcpy(out, t, PC_DK);
++	bzero(key, sizeof(key));
++	bzero(ipad, sizeof(ipad));
++	bzero(opad, sizeof(opad));
++	bzero(u, sizeof(u));
++	bzero(t, sizeof(t));
++	bzero(&in0, sizeof(in0));
++	bzero(&out0, sizeof(out0));
++	bzero(&s, sizeof(s));
++}
++
++/* HMAC-SHA256 of (d1 || d2) */
++static void
++pc_hmac(const uint8_t *k, uint32_t kl, const uint8_t *d1, size_t l1, const uint8_t *d2, size_t l2, uint8_t out[32])
++{
++	uint8_t key[64], pad[64];
++	pc_sha s;
++	memset(key, 0, sizeof(key));
++	if (kl > 64) {
++		pc_sha_init(&s);
++		pc_sha_update(&s, k, kl);
++		pc_sha_final(&s, key);
++	} else if (kl > 0) {
++		memcpy(key, k, kl);
++	}
++	for (int i = 0; i < 64; i++) {
++		pad[i] = key[i] ^ 0x36;
++	}
++	pc_sha_init(&s);
++	pc_sha_update(&s, pad, 64);
++	pc_sha_update(&s, d1, l1);
++	pc_sha_update(&s, d2, l2);
++	pc_sha_final(&s, out);
++	for (int i = 0; i < 64; i++) {
++		pad[i] = key[i] ^ 0x5c;
++	}
++	pc_sha_init(&s);
++	pc_sha_update(&s, pad, 64);
++	pc_sha_update(&s, out, 32);
++	pc_sha_final(&s, out);
++	bzero(key, sizeof(key));
++	bzero(pad, sizeof(pad));
++	bzero(&s, sizeof(s));
++}
++
++/*
++ * passcode17: HKDF-SHA256 (RFC 5869), 32 bytes out, for SweetACM: LocalAuthentication's ACMEncryptDataEx wraps
++ * with HKDF(ikm = key-13 seed, salt = externalized ACM context, info = "acm_transport") (LAC 0x207c527ac, cchkdf).
++ */
++void
++sweet_pc_hkdf32(const uint8_t *ikm, uint32_t ikml, const uint8_t *salt, uint32_t saltl, const uint8_t *info,
++    uint32_t infol, uint8_t out[32])
++{
++	static const uint8_t zero[32] = { 0 };
++	static const uint8_t one = 1;
++	uint8_t prk[32];
++	if (saltl == 0) {
++		salt = zero;
++		saltl = 32;
++	}
++	pc_hmac(salt, saltl, ikm, ikml, NULL, 0, prk);
++	pc_hmac(prk, 32, info, infol, &one, 1, out);
++	bzero(prk, sizeof(prk));
++}
++
++static int
++pc_ct_equal(const uint8_t *a, const uint8_t *b, size_t n)
++{
++	uint8_t d = 0;
++	for (size_t i = 0; i < n; i++) {
++		d |= a[i] ^ b[i];
++	}
++	return d == 0;
++}
++
++/* ---- verifier file ---- */
++static void
++pc_hex(char *o, const uint8_t *p, size_t n)
++{
++	static const char hx[] = "0123456789abcdef";
++	for (size_t i = 0; i < n; i++) {
++		o[2 * i] = hx[p[i] >> 4];
++		o[2 * i + 1] = hx[p[i] & 15];
++	}
++	o[2 * n] = 0;
++}
++
++static int
++pc_unhex(const char *s, uint8_t *p, size_t n)
++{
++	for (size_t i = 0; i < 2 * n; i++) {
++		char c = s[i];
++		int v = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
++		if (v < 0) {
++			return -1;
++		}
++		if (i & 1) {
++			p[i / 2] |= (uint8_t)v;
++		} else {
++			p[i / 2] = (uint8_t)(v << 4);
++		}
++	}
++	return 0;
++}
++
++/* lock held */
++static void
++pc_load(void)
++{
++	if (pc_stored != ST_UNKNOWN) {
++		return;
++	}
++	clock_sec_t now = pc_now();
++	if (pc_last_try != 0 && now - pc_last_try < 2) {
++		return;
++	}
++	pc_last_try = now;
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	char buf[192];
++	int resid = 0;
++	int err = vnode_open(PC_FILE, FREAD, 0, 0, &vp, ctx);
++	if (err) {
++		vnode_t dv = NULLVP;
++		if (err == ENOENT && vnode_lookup("/var/local", 0, &dv, ctx) == 0) {
++			vnode_put(dv);
++			pc_stored = ST_NONE;
++			SAY("no verifier file: no passcode\n");
++		}
++		return;         /* else the data volume is not there yet: unknown, retried */
++	}
++	bzero(buf, sizeof(buf));
++	err = vn_rdwr(UIO_READ, vp, buf, sizeof(buf) - 1, 0, UIO_SYSSPACE, IO_UNIT, vfs_context_ucred(ctx), &resid,
++	    vfs_context_proc(ctx));
++	vnode_close(vp, FREAD, ctx);
++	if (err) {
++		SAY("verifier read error %d: treated as no passcode (BAD)\n", err);
++		pc_stored = ST_BAD;
++		return;
++	}
++	if (strncmp(buf, "SWPC1 none", 10) == 0) {
++		pc_stored = ST_NONE;
++		SAY("verifier file: no passcode\n");
++		return;
++	}
++	/* SWPC1 <iter> <32 hex> <64 hex> */
++	char *p = buf;
++	if (strncmp(p, "SWPC1 ", 6) != 0) {
++		goto bad;
++	}
++	p += 6;
++	uint32_t it = 0;
++	while (*p >= '0' && *p <= '9' && it < PC_ITER_MAX) {
++		it = it * 10 + (uint32_t)(*p++ - '0');
++	}
++	if (*p++ != ' ' || it < PC_ITER_MIN || it > PC_ITER_MAX) {
++		goto bad;
++	}
++	if (pc_unhex(p, pc_salt, PC_SALT) || p[2 * PC_SALT] != ' ') {
++		goto bad;
++	}
++	p += 2 * PC_SALT + 1;
++	if (pc_unhex(p, pc_dk, PC_DK)) {
++		goto bad;
++	}
++	pc_iter = it;
++	pc_stored = ST_SET;
++	if (pc_lock_at_load && pc_mode == 3) {
++		pc_locked = 1;
++	}
++	pc_lock_at_load = 0;
++	SAY("verifier loaded (iter %u)%s\n", it, pc_locked ? ", locked at boot (mode 3)" : "");
++	return;
++bad:
++	pc_stored = ST_BAD;
++	SAY("verifier file unparsable: treated as no passcode (BAD; kern.sweet_passcode_reset=1 rewrites it)\n");
++}
++
++/* lock held. set = 0: store "none". */
++static int
++pc_store(int set)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	char line[160];
++	if (set) {
++		char sh[2 * PC_SALT + 1], dh[2 * PC_DK + 1];
++		pc_hex(sh, pc_salt, PC_SALT);
++		pc_hex(dh, pc_dk, PC_DK);
++		snprintf(line, sizeof(line), "SWPC1 %u %s %s\n", pc_iter, sh, dh);
++	} else {
++		snprintf(line, sizeof(line), "SWPC1 none\n");
++	}
++	int err = vnode_open(PC_FILE, O_CREAT | FWRITE, 0600, 0, &vp, ctx);
++	if (!err) {
++		err = vnode_setsize(vp, 0, 0, ctx);
++	}
++	if (!err) {
++		int resid = 0;
++		err = vn_rdwr(UIO_WRITE, vp, line, (int)strlen(line), 0, UIO_SYSSPACE, IO_UNIT | IO_SYNC,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!err && resid) {
++			err = EIO;
++		}
++	}
++	if (vp != NULLVP) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_mode, 0600);
++		VATTR_SET(&va, va_uid, 0);
++		VATTR_SET(&va, va_gid, 0);
++		(void)vnode_setattr(vp, &va, ctx);
++		vnode_close(vp, FWRITE, ctx);
++	}
++	bzero(line, sizeof(line));
++	return err;
++}
++
++/* ---- API for SweetKeyStore / SweetACM ---- */
++int
++sweet_pc_mode(void)
++{
++	if (!pc_inited) {
++		lck_mtx_lock(&sweet_pc_lck);
++		pc_init();
++		lck_mtx_unlock(&sweet_pc_lck);
++	}
++	return pc_mode;
++}
++
++int
++sweet_pc_is_set(void)
++{
++	if (sweet_pc_mode() == 0) {
++		return 0;
++	}
++	lck_mtx_lock(&sweet_pc_lck);
++	pc_load();
++	int r = pc_stored == ST_SET;
++	lck_mtx_unlock(&sweet_pc_lck);
++	return r;
++}
++
++int
++sweet_pc_locked(void)
++{
++	return sweet_pc_mode() != 0 && sweet_pc_mode() != 2 && sweet_pc_is_set() && pc_locked;
++}
++
++static uint32_t
++pc_backoff_left(void)
++{
++	clock_sec_t now = pc_now();
++	return pc_backoff_until > now ? (uint32_t)(pc_backoff_until - now) : 0;
++}
++
++/* keybag_state bits: 1 locked, 2 no_pin, 4 been_unlocked (always). sls: 0 unlocked, 1 locked, 3 disabled. */
++void
++sweet_pc_aks_state(uint32_t *ss, uint32_t *sls, uint32_t *sfa, uint32_t *sb)
++{
++	int set = sweet_pc_is_set(), locked = sweet_pc_locked();
++	*ss = set ? (locked ? 0x5 : 0x4) : 0x6;
++	*sls = set ? (locked ? 1 : 0) : 3;
++	lck_mtx_lock(&sweet_pc_lck);
++	*sfa = pc_fails;
++	*sb = pc_backoff_left();
++	lck_mtx_unlock(&sweet_pc_lck);
++}
++
++/* lock held. 0 ok, EAUTH wrong, EBUSY backoff. No passcode stored: ok for any input. */
++static int
++pc_check_locked(const uint8_t *pw, uint32_t len, int unlock)
++{
++	pc_load();
++	if (pc_stored != ST_SET) {
++		return 0;
++	}
++	if (pc_backoff_left() > 0) {
++		pc_n_busy++;
++		return EBUSY;
++	}
++	uint8_t dk[PC_DK];
++	pc_pbkdf2(pw, len, pc_salt, PC_SALT, pc_iter, dk);
++	int ok = pc_ct_equal(dk, pc_dk, PC_DK);
++	bzero(dk, sizeof(dk));
++	if (ok) {
++		pc_fails = 0;
++		pc_backoff_until = 0;
++		pc_n_ok++;
++		if (unlock && pc_locked) {
++			pc_locked = 0;
++			pc_unlocked_event = 1;
++		}
++		return 0;
++	}
++	pc_fails++;
++	pc_n_bad++;
++	if (pc_fails >= PC_FREE_FAILS) {
++		uint32_t n = pc_fails - PC_FREE_FAILS, d = 60;
++		while (n-- > 0 && d < PC_BACKOFF_MAX) {
++			d *= 2;
++		}
++		if (d > PC_BACKOFF_MAX) {
++			d = PC_BACKOFF_MAX;
++		}
++		pc_backoff_until = pc_now() + d;
++	}
++	return EAUTH;
++}
++
++int
++sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock)
++{
++	if (sweet_pc_mode() == 0) {
++		return 0;
++	}
++	if (len > PC_MAXLEN) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_pc_lck);
++	int r = pc_check_locked(pw, len, unlock);
++	uint32_t f = pc_fails;
++	int ev = pc_unlocked_event;
++	pc_unlocked_event = 0;
++	lck_mtx_unlock(&sweet_pc_lck);
++	SAY("check (len %u%s) -> %s, fails %u\n", len, unlock ? ", unlock" : "",
++	    r == 0 ? "ok" : r == EBUSY ? "backoff" : "WRONG", f);
++	if (ev) {
++		pc_notify("unlocked");
++	} else if (r == EAUTH) {
++		pc_notify("failed attempt");    /* sfa / sb changed */
++	}
++	return r;
++}
++
++static int
++pc_copyin(uint64_t ua, uint32_t len, uint8_t *buf)
++{
++	if (len > PC_MAXLEN) {
++		return EINVAL;
++	}
++	if (len == 0) {
++		return 0;
++	}
++	if (ua == 0) {
++		return EFAULT;
++	}
++	return copyin((user_addr_t)ua, buf, len);
++}
++
++/* passcode15: a 16-byte secret naming an ACM context is that context's passcode (SweetACM.cpp) */
++static void
++pc_resolve(uint8_t *buf, uint32_t *len, const char *what)
++{
++	int ctx = 0;
++	uint32_t l0 = *len;
++	if (l0 != 16) {
++		return;
++	}
++	if (sweet_acm_resolve_secret(buf, len, PC_MAXLEN, &ctx)) {
++		SAY("%s: 16-byte ACM context #%d -> passcode len %u\n", what, ctx, *len);
++	} else {
++		SAY("%s: 16-byte secret is %s, used as is\n", what, ctx == -1 ? "a context with an unreadable passcode" :
++		    "not a live ACM context");
++	}
++}
++
++/*
++ * passcode19 (iOS 27.2): aks_verify_password(_with_acm) (AppleKeyStore 0x23fefc98c) sends sel 42 with 5 scalars:
++ * handle, memento, user pointer and length of a packed buffer (u32 count, then per item u32 length + bytes padded
++ * to 4; AppleKeyStore 0x23fea9b80), with_acm flag. Item 0 is the passcode or, with_acm, the 16-byte ACM context.
++ * Settings checks the current passcode this way before "Change Passcode"; the struct-only parser answered
++ * kIOReturnBadArgument (LAPSErrorDomain 9).
++ */
++int
++sweet_pc_verify_packed_user(uint64_t ua, uint32_t len)
++{
++	uint8_t buf[PC_MAXLEN + 16];
++	uint32_t cnt, ilen;
++	int e;
++	if (len < 8 || len > sizeof(buf) || ua == 0) {
++		return EINVAL;
++	}
++	if ((e = copyin((user_addr_t)ua, buf, len)) != 0) {
++		return e;
++	}
++	memcpy(&cnt, buf, 4);
++	memcpy(&ilen, buf + 4, 4);
++	if (cnt < 1 || ilen > len - 8 || ilen > PC_MAXLEN) {
++		bzero(buf, sizeof(buf));
++		return EINVAL;
++	}
++	uint8_t *pw = buf + 8;
++	pc_resolve(pw, &ilen, "verify");
++	e = sweet_pc_check_kbuf(pw, ilen, 0);
++	bzero(buf, sizeof(buf));
++	return e;
++}
++
++int
++sweet_pc_check_user(uint64_t uaddr, uint32_t len, int unlock)
++{
++	uint8_t pw[PC_MAXLEN];
++	int e = pc_copyin(uaddr, len, pw);
++	if (e == 0) {
++		pc_resolve(pw, &len, unlock ? "unlock" : "check");
++		e = sweet_pc_check_kbuf(pw, len, unlock);
++	}
++	bzero(pw, sizeof(pw));
++	return e;
++}
++
++int
++sweet_pc_change_user(uint64_t old_ua, uint32_t old_len, uint64_t new_ua, uint32_t new_len)
++{
++	uint8_t o[PC_MAXLEN], n[PC_MAXLEN];
++	int e;
++	if (sweet_pc_mode() == 0) {
++		return EPERM;
++	}
++	if ((e = pc_copyin(old_ua, old_len, o)) != 0 || (e = pc_copyin(new_ua, new_len, n)) != 0) {
++		goto out;
++	}
++	pc_resolve(o, &old_len, "change old");
++	pc_resolve(n, &new_len, "change new");
++	lck_mtx_lock(&sweet_pc_lck);
++	e = pc_check_locked(o, old_len, 0);
++	if (e == 0) {
++		if (new_len == 0) {
++			e = pc_store(0);
++			if (e == 0) {
++				pc_stored = ST_NONE;
++				pc_locked = 0;
++			}
++		} else {
++			uint8_t salt[PC_SALT], dk[PC_DK];
++			read_random(salt, PC_SALT);
++			pc_pbkdf2(n, new_len, salt, PC_SALT, PC_ITER, dk);
++			uint8_t os[PC_SALT], od[PC_DK];
++			uint32_t oi = pc_iter;
++			memcpy(os, pc_salt, PC_SALT);
++			memcpy(od, pc_dk, PC_DK);
++			memcpy(pc_salt, salt, PC_SALT);
++			memcpy(pc_dk, dk, PC_DK);
++			pc_iter = PC_ITER;
++			e = pc_store(1);
++			if (e == 0) {
++				pc_stored = ST_SET;
++				pc_locked = 0;
++			} else {                /* keep the old verifier in memory */
++				memcpy(pc_salt, os, PC_SALT);
++				memcpy(pc_dk, od, PC_DK);
++				pc_iter = oi;
++			}
++			bzero(dk, sizeof(dk));
++			bzero(od, sizeof(od));
++		}
++	}
++	lck_mtx_unlock(&sweet_pc_lck);
++	SAY("change (old len %u, new len %u) -> %d%s\n", old_len, new_len, e,
++	    e == 0 ? (new_len ? ": verifier stored" : ": passcode removed") : e == EAUTH ? ": old passcode WRONG" : "");
++	if (e == 0) {
++		pc_notify(new_len ? "passcode set" : "passcode removed");
++	}
++out:
++	bzero(o, sizeof(o));
++	bzero(n, sizeof(n));
++	return e;
++}
++
++void
++sweet_pc_lock(void)
++{
++	int m = sweet_pc_mode();
++	if (m == 0 || m == 2 || !sweet_pc_is_set()) {
++		return;
++	}
++	int ev = 0;
++	lck_mtx_lock(&sweet_pc_lck);
++	if (!pc_locked) {
++		pc_locked = 1;
++		ev = 1;
++		SAY("locked\n");
++	}
++	lck_mtx_unlock(&sweet_pc_lck);
++	if (ev) {
++		pc_notify("locked");
++	}
++}
++
++/* ---- sysctls ---- */
++static int
++sysctl_sweet_passcode(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = sweet_pc_mode(), changed = 0;
++	int e = sysctl_io_number(req, pc_mode, sizeof(pc_mode), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	char pn[32];
++	proc_selfname(pn, (int)sizeof(pn));
++	if (pc_pinned) {
++		SAY("kern.sweet_passcode=%d by %s REFUSED: pinned off by boot-arg sweetpasscode=0\n", v, pn);
++		return EPERM;
++	}
++	if (v < 0 || v > 3) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_pc_lck);
++	int was = pc_mode;
++	pc_mode = v;
++	if (v == 0) {
++		pc_locked = 0;
++	}
++	pc_stored = ST_UNKNOWN;         /* re-read the file when next needed */
++	pc_last_try = 0;
++	lck_mtx_unlock(&sweet_pc_lck);
++	SAY("kern.sweet_passcode %d -> %d by %s\n", was, v, pn);
++	if (v != 0) {
++		sweet_acm_publish();
++	}
++	pc_notify("mode change");       /* SpringBoard re-reads: recovery to 0 drops its passcode state at once */
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_passcode, "I",
++    "redfin 1195: 0 off (no passcode, as before), 1 passcode + lock state, 2 passcode never locked, 3 = 1 locked at boot");
++
++static int
++sysctl_sweet_passcode_reset(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = 0, changed = 0;
++	int e = sysctl_io_number(req, 0, sizeof(int), &v, &changed);
++	if (e || !changed || v != 1) {
++		return e ? e : (changed ? EINVAL : 0);
++	}
++	char pn[32];
++	proc_selfname(pn, (int)sizeof(pn));
++	(void)sweet_pc_mode();
++	lck_mtx_lock(&sweet_pc_lck);
++	e = pc_store(0);
++	pc_stored = e ? ST_UNKNOWN : ST_NONE;
++	pc_locked = 0;
++	pc_fails = 0;
++	pc_backoff_until = 0;
++	bzero(pc_dk, sizeof(pc_dk));
++	lck_mtx_unlock(&sweet_pc_lck);
++	SAY("RESET by %s: verifier -> none (%d)\n", pn, e);
++	if (pc_mode != 0) {
++		pc_notify("reset");
++	}
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode_reset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_passcode_reset, "I", "redfin 1195: write 1 (root) to store 'no passcode' and clear lock/backoff");
++
++/*
++ * 1196: kern.sweet_passcode_notify=1 (root) sends a keybag status event by hand; =2 also locks (as
++ * aks_lock_device would), for testing the lock screen without waiting for SpringBoard. Mode != 0 only.
++ */
++static int
++sysctl_sweet_passcode_notify(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	int v = 0, changed = 0;
++	int e = sysctl_io_number(req, 0, sizeof(int), &v, &changed);
++	if (e || !changed) {
++		return e;
++	}
++	if (sweet_pc_mode() == 0) {
++		return EPERM;
++	}
++	if (v == 2) {
++		sweet_pc_lock();        /* notifies when it locks */
++		return 0;
++	}
++	if (v != 1) {
++		return EINVAL;
++	}
++	pc_notify("sysctl");
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode_notify, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_passcode_notify, "I", "redfin 1196: 1 = send a keybag status event, 2 = lock now (mode != 0)");
++
++static int
++sysctl_sweet_passcode_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	static const char *const st[] = { "unknown", "none", "set", "BAD" };
++	char b[256];
++	int m = sweet_pc_mode();
++	if (m != 0) {
++		(void)sweet_pc_is_set();
++	}
++	lck_mtx_lock(&sweet_pc_lck);
++	snprintf(b, sizeof(b), "mode=%d pinned=%d stored=%s%s locked=%d fails=%u backoff=%u iter=%u ok=%u bad=%u busy=%u events=%u",
++	    m, pc_pinned, st[pc_stored], m == 0 ? "(ignored)" : "", m != 0 && m != 2 && pc_locked, pc_fails,
++	    pc_backoff_left(), pc_iter, pc_n_ok, pc_n_bad, pc_n_busy, pc_n_notify);
++	lck_mtx_unlock(&sweet_pc_lck);
++	return SYSCTL_OUT(req, b, strlen(b) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_passcode_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_passcode_state, "A", "redfin 1195: passcode state");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetACM.cpp b/iokit/Kernel/arm/SweetACM.cpp
+new file mode 100644
+index 0000000..b0379d0
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetACM.cpp
+@@ -0,0 +1,962 @@
++/*
++ * redfin 1195: SweetACM, a stand-in for Apple's credential manager (AppleCredentialManager +
++ * AppleCredentialManagerUserClient) for libACM (LocalAuthentication SharedUtils: coreauthd, ModuleACM,
++ * Security). Design: logs/research/passcode-acm-design-2026-11-18.md.
++ *
++ * Published on IOResources only when kern.sweet_passcode != 0 (boot-arg sweetpasscode=1..3 or the sysctl);
++ * at 0 it does not exist (as today), and if the mode drops back to 0 every call answers kIOReturnNotPermitted.
++ *
++ * User client (iPhone 8 kernelcache): selector 0 = command channel (struct in/out), 1 and 2 = one scalar out.
++ * Command buffer (libACM LibCall_BuildCommand): le32 'DRCS' | u8 cmd | u8 0 | u8 arg | u8 0 | payload.
++ * Errors are the IOReturn itself in libACM's numbering (-3: unsupported / bad parameter; ContextCreate falls
++ * back from cmd 36 to cmd 1 on -3).
++ *
++ * Emulated: contexts (1, 2, 18), AddCredential (5): PassphraseEntered is checked against the stored passcode
++ * verifier (sweet_passcode.c, same failure counter/backoff), PasscodeValidated cannot be added from userland,
++ * BiometryMatched only when the kernel armed a verified match (sweet_acm_note_verified_match, no caller yet:
++ * SweetMesa calls it later, only for keymaster-verified matches); RemoveCredentials (6, 9); VerifyPolicy (3):
++ * satisfied iff the context holds a fresh passcode-validated or verified biometric credential.
++ * Accepted no-ops: 26 KernelControl, 28 DoubleClickNotify, 44 SetEnvironmentVariable. Everything else -3.
++ * Every command is logged; payload bytes only for commands that cannot carry a secret (never cmd 5).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <sys/sysctl.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <string.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/OSAtomic.h>
++
++extern "C" {
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/random.h>
++#include <kern/clock.h>
++int sweet_pc_mode(void);
++int sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock);
++void sweet_acm_publish(void);
++void sweet_acm_note_verified_match(void);
++int sweet_acm_resolve_secret(uint8_t *buf, uint32_t *len, uint32_t cap, int *ctxno);
++void sweet_pc_hkdf32(const uint8_t *ikm, uint32_t ikml, const uint8_t *salt, uint32_t saltl, const uint8_t *info,
++    uint32_t infol, uint8_t out[32]);
++}
++
++#define SAY(fmt, ...) IOLog("SWEET ACM: " fmt, ##__VA_ARGS__)
++
++#define ACM_MAGIC       0x53435244u     /* 'DRCS' */
++#define ACM_HDR         8
++#define ACM_IO_MAX      16384
++#define ACM_CTX_MAX     64
++#define ACM_ID          16
++#define ACM_CRED_HDR    32              /* u32 type @0 ... u32 data length @0x1c */
++#define ACM_TTL_S       600             /* passcode / biometric credential freshness */
++#define ACM_BIO_ARM_S   5               /* a verified match must be consumed within this */
++#define ACM_ERR         ((IOReturn)-3)
++#include "SweetACMGCM.h"
++#define ACM_NOT_FOUND   ((IOReturn)-7)    /* guacamole: what ACMLib callers read as "no such item" */
++
++/* credential types (kernel ACM name table order) */
++enum {
++	kCredPasscodeValidated = 1, kCredPassphraseEntered = 2, kCredBiometryMatched = 3, kCredUserConsent = 4,
++	kCredPasscodeValidated2 = 10, kCredDeviceRestrictedMode = 11, kCredMax = 21,
++};
++
++/* libACM commands (SharedUtils LibCall_*) */
++static const char *
++acm_name(uint32_t c)
++{
++	switch (c) {
++	case 1: return "ContextCreate";
++	case 2: return "ContextDelete";
++	case 3: return "VerifyPolicy";
++	case 5: return "AddCredential";
++	case 6: return "RemoveCredentialsByValue";
++	case 9: return "RemoveCredentialsByType";
++	case 18: return "ContextCreateWithExternalForm";
++	case 19: return "ContextGetExternalForm";
++	case 25: return "GetEnvironmentVariable";
++	case 26: return "KernelControl";
++	case 27: return "GlobalContextCredentialGetProperty";
++	case 28: return "KernDoubleClickNotify";
++	case 31: return "GetAclAuthMethod";
++	case 33: return "ContextCredentialGetProperty";
++	case 36: return "ContextCreate2";
++	case 37: return "ContextCreateWithExternalForm2";
++	case 38: return "TRMLoadState";
++	case 40: return "ContextSetData";
++	case 41: return "ContextGetData";
++	case 44: return "SetEnvironmentVariable";
++	case 45: return "PublishTrustedAccessories";
++	case 46: return "ContextGetInfo";
++	case 48: return "ContextLoadFromImage";
++	case 49: return "ContextUnloadToImage";
++	case 51: return "SEPControl";
++	default: return "?";
++	}
++}
++
++struct acm_ctx {
++	bool used;
++	uint8_t id[ACM_ID];
++	uint64_t serial;
++	clock_sec_t pass_at, bio_at;
++	uint32_t creds;                 /* bit per credential type added */
++	/* passcode4: ContextSetData values (iOS 27 coreauthd stores its DTO config, key 9, 20 bytes) */
++	struct { uint32_t key, len; uint8_t v[64]; bool used; } data[4];
++	/* passcode17: key 7 unwrapped when it is stored (the passcode, as the SEP would see it) */
++	bool pwok;
++	uint32_t pwlen;
++	uint8_t pw[64];
++};
++
++static acm_ctx gCtx[ACM_CTX_MAX];
++static acm_ctx gGlobal;                 /* id all zero */
++static IOLock *gL;
++static uint64_t gSerial;
++static clock_sec_t gBioArmedAt;
++static volatile UInt32 gPublished;
++static uint32_t nCmds, nUnsup, nRefused, nPassOk, nPassBad, nBioOk, nBioRefused, nCtx, nPolicyYes, nPolicyNo;
++static uint32_t gLastCmd;
++static IOReturn gLastRet;
++static uint32_t gLogged[64];
++/*
++ * passcode16: key 13 is one key for every context (made once per boot), not one per context. Preferences takes
++ * key 13 from one context and stores the wrapped passcode (key 7) on another (the confirm entry: ctx #31's key,
++ * ctx #30's key 7), so per-context keys unwrapped it to garbage and the stored verifier never matched.
++ */
++static uint8_t gKey13[32];
++static bool gKey13Made;
++#define ACM_GONE        16
++static uint8_t gGone[ACM_GONE][ACM_ID];   /* ids of recently deleted contexts (possible HKDF salts) */
++static uint32_t gGoneNext;
++
++/* gL held */
++static const uint8_t *
++key13(void)
++{
++	if (!gKey13Made) {
++		read_random(gKey13, sizeof(gKey13));
++		gKey13Made = true;
++	}
++	return gKey13;
++}
++
++/*
++ * passcode17 (iOS 27.2): ACMEncryptDataEx mode 2 = AES-256-GCM under HKDF-SHA256(ikm = key-13 seed, salt = the
++ * externalized ACM context passed to -[LACACMHelper encodeData:seed:externalizedContext:error:] (LAC 0x207b35aac),
++ * info = "acm_transport") (LAC 0x207c53310 -> 0x207c527ac cchkdf), blob 0x02 | IV16 | ct | tag16. passcode10-16
++ * used the seed itself as the AES key: garbage (profiled 'nil argument' for letters, keyboardType 2 for digits,
++ * no unlock). Which context was the salt is not known here, so every candidate is tried and the GCM tag decides.
++ * gL held. Returns 1 with the plaintext in out; how: 0 own context, N other live ctx #N, -1 deleted, -2 zero, -3 none.
++ */
++static int
++acm_unwrap(const acm_ctx *own, const uint8_t *b, uint32_t len, uint8_t *out, uint32_t cap, uint32_t *olen, int *how)
++{
++	static const uint8_t info[] = "acm_transport";
++	static const uint8_t zero[ACM_ID] = { 0 };
++	if (len < 33 || b[0] != 2 || len - 33 > cap) {
++		return 0;
++	}
++	uint32_t n = len - 33;
++	uint8_t k[32];
++	for (int i = -1; i < ACM_CTX_MAX + ACM_GONE + 2; i++) {
++		const uint8_t *salt;
++		uint32_t sl = ACM_ID;
++		int h;
++		if (i == -1) {
++			if (own == NULL || own == &gGlobal) {
++				continue;
++			}
++			salt = own->id;
++			h = 0;
++		} else if (i < ACM_CTX_MAX) {
++			if (!gCtx[i].used || &gCtx[i] == own) {
++				continue;
++			}
++			salt = gCtx[i].id;
++			h = (int)gCtx[i].serial;
++		} else if (i < ACM_CTX_MAX + ACM_GONE) {
++			salt = gGone[i - ACM_CTX_MAX];
++			if (memcmp(salt, zero, ACM_ID) == 0) {
++				continue;
++			}
++			h = -1;
++		} else if (i == ACM_CTX_MAX + ACM_GONE) {
++			salt = zero;
++			h = -2;
++		} else {
++			salt = NULL;
++			sl = 0;
++			h = -3;
++		}
++		sweet_pc_hkdf32(key13(), 32, salt, sl, info, sizeof(info) - 1, k);
++		if (gcm_open16(k, b + 1, b + 17, n, b + 17 + n, out)) {
++			bzero(k, sizeof(k));
++			*olen = n;
++			*how = h;
++			return 1;
++		}
++	}
++	bzero(k, sizeof(k));
++	bzero(out, n);
++	return 0;
++}
++
++static clock_sec_t
++acm_now(void)
++{
++	clock_sec_t s;
++	clock_usec_t us;
++	clock_get_system_microtime(&s, &us);
++	return s;
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static void
++put32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16);
++	p[3] = (uint8_t)(v >> 24);
++}
++
++/* gL held */
++static acm_ctx *
++ctx_find(const uint8_t *id)
++{
++	static const uint8_t zero[ACM_ID] = { 0 };
++	if (memcmp(id, zero, ACM_ID) == 0) {
++		return &gGlobal;
++	}
++	for (int i = 0; i < ACM_CTX_MAX; i++) {
++		if (gCtx[i].used && memcmp(gCtx[i].id, id, ACM_ID) == 0) {
++			return &gCtx[i];
++		}
++	}
++	return NULL;
++}
++
++/* gL held: a free slot, else the oldest */
++static acm_ctx *
++ctx_new(void)
++{
++	acm_ctx *c = NULL;
++	for (int i = 0; i < ACM_CTX_MAX && c == NULL; i++) {
++		if (!gCtx[i].used) {
++			c = &gCtx[i];
++		}
++	}
++	if (c == NULL) {
++		c = &gCtx[0];
++		for (int i = 1; i < ACM_CTX_MAX; i++) {
++			if (gCtx[i].serial < c->serial) {
++				c = &gCtx[i];
++			}
++		}
++	}
++	bzero(c, sizeof(*c));
++	c->used = true;
++	c->serial = ++gSerial;
++	read_random(c->id, ACM_ID);
++	c->id[0] |= 1;                  /* never the all-zero global id */
++	nCtx++;
++	return c;
++}
++
++static bool
++fresh(clock_sec_t t, clock_sec_t now)
++{
++	return t != 0 && now - t <= ACM_TTL_S;
++}
++
++/* One command. p/n = payload after the 8-byte header. Fills o (cap ocap), *olen. */
++static IOReturn
++acm_cmd(uint32_t cmd, const uint8_t *p, uint32_t n, uint8_t *o, uint32_t ocap, uint32_t *olen, char *note,
++    size_t notesz)
++{
++	IOReturn r = kIOReturnSuccess;
++	clock_sec_t now = acm_now();
++	acm_ctx *c;
++	*olen = 0;
++	switch (cmd) {
++	case 1:                                 /* ContextCreate: out id16 + u8 */
++		if (ocap < ACM_ID + 1) {
++			return ACM_ERR;
++		}
++		IOLockLock(gL);
++		c = ctx_new();
++		memcpy(o, c->id, ACM_ID);
++		o[ACM_ID] = 0;
++		IOLockUnlock(gL);
++		*olen = ACM_ID + 1;
++		snprintf(note, notesz, "ctx #%llu", c->serial);
++		return r;
++	case 18:                                /* ContextCreateWithExternalForm: id16 ... */
++	case 37:                                /* ContextCreateWithExternalForm2 */
++		/*
++		 * passcode9 (iOS 27.2): LibCall_ACMContextCreateWithExternalForm (LAC 0x207c55698) tries cmd 37 with
++		 * 9 bytes of room, then cmd 18 with 5: u32 (0 = no context, the call then returns nil), u8 flag, and
++		 * for 37 a u32 kept with the context. The id is the 16 bytes it sent. profiled needs this to check the
++		 * new passcode against the profile rules ("Couldn't create wrapper context for externalized context").
++		 */
++		if (n < ACM_ID || (ocap != 5 && ocap != 9 && ocap < ACM_ID + 1)) {
++			return ACM_ERR;
++		}
++		IOLockLock(gL);
++		c = ctx_find(p);
++		if (c != NULL && c != &gGlobal && (ocap == 5 || ocap == 9)) {
++			bzero(o, ocap);
++			put32(o, (uint32_t)c->serial);
++			if (ocap == 9) {
++				put32(o + 5, (uint32_t)c->serial);
++			}
++			*olen = ocap;
++			snprintf(note, notesz, "ctx #%llu (short form)", c->serial);
++		} else if (c != NULL && c != &gGlobal) {
++			memcpy(o, c->id, ACM_ID);
++			o[ACM_ID] = 0;
++			*olen = ACM_ID + 1;
++			snprintf(note, notesz, "ctx #%llu", c->serial);
++		} else {
++			r = ACM_ERR;
++			snprintf(note, notesz, "unknown context");
++		}
++		IOLockUnlock(gL);
++		return r;
++	case 2:                                 /* ContextDelete: id16 */
++		if (n < ACM_ID) {
++			return ACM_ERR;
++		}
++		IOLockLock(gL);
++		c = ctx_find(p);
++		if (c != NULL && c != &gGlobal) {
++			snprintf(note, notesz, "ctx #%llu", c->serial);
++			memcpy(gGone[gGoneNext++ % ACM_GONE], c->id, ACM_ID);
++			bzero(c, sizeof(*c));
++		}
++		IOLockUnlock(gL);
++		return r;
++	case 5: {                               /* AddCredential: id16 | cred hdr32 + data | u32 scope */
++		if (n < ACM_ID + ACM_CRED_HDR) {
++			return ACM_ERR;
++		}
++		uint32_t type = le32(p + ACM_ID), dlen = le32(p + ACM_ID + 0x1c);
++		const uint8_t *data = p + ACM_ID + ACM_CRED_HDR;
++		if (dlen > n - ACM_ID - ACM_CRED_HDR || type > kCredMax) {
++			return ACM_ERR;
++		}
++		if (type == kCredPasscodeValidated || type == kCredPasscodeValidated2 || type == kCredDeviceRestrictedMode) {
++			nRefused++;
++			snprintf(note, notesz, "type %u REFUSED (only SweetACM grants it)", type);
++			return ACM_ERR;
++		}
++		if (type == kCredPassphraseEntered) {
++			int e = sweet_pc_check_kbuf(data, dlen, 0);     /* never logged: length only */
++			IOLockLock(gL);
++			c = ctx_find(p);
++			if (c != NULL && e == 0) {
++				c->pass_at = now;
++				c->creds |= 1u << kCredPasscodeValidated;
++			}
++			IOLockUnlock(gL);
++			if (e == 0) {
++				nPassOk++;
++			} else {
++				nPassBad++;
++			}
++			snprintf(note, notesz, "passphrase len %u -> %s%s", dlen, e == 0 ? "validated" : e == EBUSY ? "backoff" :
++			    "WRONG (not granted)", c == NULL ? " (unknown context)" : "");
++			return c == NULL ? ACM_ERR : kIOReturnSuccess;
++		}
++		if (type == kCredBiometryMatched) {
++			IOLockLock(gL);
++			bool armed = gBioArmedAt != 0 && now - gBioArmedAt <= ACM_BIO_ARM_S;
++			c = ctx_find(p);
++			if (armed && c != NULL) {
++				gBioArmedAt = 0;                        /* one match, one credential */
++				c->bio_at = now;
++				c->creds |= 1u << kCredBiometryMatched;
++			}
++			IOLockUnlock(gL);
++			if (!armed || c == NULL) {
++				nBioRefused++;
++				snprintf(note, notesz, "BiometryMatched REFUSED: no kernel-verified match armed");
++				return ACM_ERR;
++			}
++			nBioOk++;
++			snprintf(note, notesz, "BiometryMatched from a verified match");
++			return r;
++		}
++		IOLockLock(gL);
++		c = ctx_find(p);
++		if (c != NULL) {
++			c->creds |= 1u << type;
++		}
++		IOLockUnlock(gL);
++		snprintf(note, notesz, "type %u len %u recorded%s", type, dlen, c == NULL ? " (unknown context)" : "");
++		return c == NULL ? ACM_ERR : r;
++	}
++	case 6:                                 /* RemoveCredentialsByValue(AndScope) */
++	case 9:                                 /* RemoveCredentialsByType(AndScope) */
++		if (n < ACM_ID) {
++			return ACM_ERR;
++		}
++		IOLockLock(gL);
++		c = ctx_find(p);
++		if (c != NULL) {
++			c->creds = 0;
++			c->pass_at = 0;
++			c->bio_at = 0;
++		}
++		IOLockUnlock(gL);
++		return r;
++	case 3: {                               /* VerifyPolicy: id16 | policy cstring | u8 | u32 | params */
++		if (n < ACM_ID + 1) {
++			return ACM_ERR;
++		}
++		char pol[48];
++		uint32_t pl = 0;
++		while (ACM_ID + pl < n && pl < sizeof(pol) - 1 && p[ACM_ID + pl] >= 0x20 && p[ACM_ID + pl] < 0x7f) {
++			pol[pl] = (char)p[ACM_ID + pl];
++			pl++;
++		}
++		pol[pl] = 0;
++		IOLockLock(gL);
++		c = ctx_find(p);
++		bool sat = c != NULL && (fresh(c->pass_at, now) || fresh(c->bio_at, now));
++		IOLockUnlock(gL);
++		/*
++		 * passcode5 (iOS 27.2): Stolen Device Protection is off here (the SEPControl ratchet answer says so), so
++		 * its extra biometric step has nothing to ask: coreauthd checks 'BiometricRatchetAuthentication' on the
++		 * global context before every passcode change and cancelled it when told "not satisfied".
++		 */
++		if (strcmp(pol, "BiometricRatchetAuthentication") == 0) {
++			sat = true;
++		}
++		if (sat) {
++			nPolicyYes++;
++		} else {
++			nPolicyNo++;
++		}
++		snprintf(note, notesz, "policy '%s' -> %s%s", pol, sat ? "satisfied" : "NOT satisfied",
++		    c == NULL ? " (unknown context)" : "");
++		/*
++		 * passcode5 (iOS 27.2): u32 satisfied, then the requirement: u32 type, u32 state, u32, u32 data length,
++		 * data (LibCall_ACMContextVerifyPolicyAndCopyRequirementEx 0x207ae1858 -> parser 0x207ae2218). The parser
++		 * refuses (-16) a data length below the size its type needs; the iOS 16 answer had 0 there, so every
++		 * VerifyPolicy failed as "ACM verification of ... failed: -16". 512 zero bytes cover the type-1 size.
++		 */
++		if (ocap < 4 + 16 + 512) {
++			return ACM_ERR;
++		}
++		bzero(o, 4 + 16 + 512);
++		put32(o, sat ? 1 : 0);
++		put32(o + 4, 1);                /* requirement: type 1 (passcode) */
++		put32(o + 8, sat ? 1 : 0);      /* state */
++		put32(o + 16, 512);             /* data length */
++		*olen = 4 + 16 + 512;
++		return r;
++	}
++	case 26:
++	case 28:
++	case 44:
++		snprintf(note, notesz, "accepted (no-op)");
++		return r;
++	case 19:                                /* ContextGetExternalForm: id16 (the form is the id itself) */
++		/*
++		 * passcode4 (iOS 27.2): ACMContextGetExternalForm (LAC 0x207c41b58: cmd 0x13, 16-byte input, no output)
++		 * only asks whether the context exists; -3 failed every "externalizedContextWithReply" in coreauthd.
++		 */
++		if (n < ACM_ID) {
++			return ACM_ERR;
++		}
++		IOLockLock(gL);
++		c = ctx_find(p);
++		IOLockUnlock(gL);
++		snprintf(note, notesz, "%s", c != NULL ? "known context" : "unknown context");
++		return c != NULL ? r : ACM_NOT_FOUND;
++	case 40:                                /* ContextSetData: id16 | u32 key | u32 len | data */
++	case 41: {                              /* ContextGetData: id16 | u32 key -> u32 len | data */
++		/*
++		 * passcode4 (iOS 27.2): coreauthd's "DTOConfig update" sets key 9 (20 bytes) on the evaluation context and
++		 * fails the passcode change with "Failed to set ACM credential data: -3" when refused. Kept per context.
++		 */
++		if (n < ACM_ID + 4) {
++			return ACM_ERR;
++		}
++		uint32_t key = le32(p + ACM_ID), dl = n >= ACM_ID + 8 ? le32(p + ACM_ID + 4) : 0;
++		/*
++		 * passcode18 (iOS 27.2): GetData is id16 | u32 key | u8 size-only | extra (LAC serializer 0x207c51f98,
++		 * LibCall_ACMContextGetData 0x207c575c4); ACMContextGetDataEx asks the size (flag 1) and then the bytes
++		 * (flag 0). passcode6-17 told them apart by a 4-byte reply buffer, so the bytes of a 4-character passcode
++		 * came back as its length ("\4\0\0\0"): profiled saw a non-digit passcode and saved keyboardType 2
++		 * (the full keyboard on the lock screen).
++		 */
++		bool sizeq = cmd == 41 && n > ACM_ID + 4 && p[ACM_ID + 4] != 0;
++		IOLockLock(gL);
++		c = ctx_find(p);
++		if (c == NULL) {
++			IOLockUnlock(gL);
++			snprintf(note, notesz, "key %u: unknown context", key);
++			return ACM_NOT_FOUND;
++		}
++		int slot = -1, free_slot = -1;
++		for (int i = 0; i < 4; i++) {
++			if (c->data[i].used && c->data[i].key == key) {
++				slot = i;
++			} else if (!c->data[i].used && free_slot < 0) {
++				free_slot = i;
++			}
++		}
++		if (cmd == 40) {
++			if (dl > sizeof(c->data[0].v) || ACM_ID + 8 + dl > n) {
++				IOLockUnlock(gL);
++				snprintf(note, notesz, "key %u len %u: too long", key, dl);
++				return ACM_ERR;
++			}
++			if (slot < 0) {
++				slot = free_slot >= 0 ? free_slot : 0;
++			}
++			c->data[slot].used = true;
++			c->data[slot].key = key;
++			c->data[slot].len = dl;
++			memcpy(c->data[slot].v, p + ACM_ID + 8, dl);
++			if ((key & 0xffff) == 7) {
++				int how = 0;
++				c->pwok = false;
++				if (dl == 0) {
++					c->pwok = true;         /* empty: no passcode */
++					c->pwlen = 0;
++				} else if (acm_unwrap(c, c->data[slot].v, dl, c->pw, sizeof(c->pw), &c->pwlen, &how)) {
++					c->pwok = true;
++				}
++				IOLockUnlock(gL);
++				if (dl == 0) {
++					snprintf(note, notesz, "key 7 len 0 stored (empty passcode), ctx #%llu", c->serial);
++				} else if (c->pwok) {
++					snprintf(note, notesz, "key 7 len %u stored, ctx #%llu, unwrapped (%u bytes, salt %s%d)", dl,
++					    c->serial, c->pwlen, how == 0 ? "own ctx" : how > 0 ? "ctx #" : how == -1 ? "deleted ctx" :
++					    how == -2 ? "zero id" : "none", how > 0 ? how : 0);
++				} else {
++					snprintf(note, notesz, "key 7 len %u stored, ctx #%llu, NOT unwrapped (no salt matched the tag)",
++					    dl, c->serial);
++				}
++				return r;
++			}
++			IOLockUnlock(gL);
++			snprintf(note, notesz, "key %u len %u stored", key, dl);
++			return r;
++		}
++		if (cmd == 41 && slot < 0 && (key & 0xffff) == 13 && (slot = free_slot >= 0 ? free_slot : 0) >= 0) {
++			/*
++			 * passcode7 (iOS 27.2): key 13 is data ACM itself holds on every context; LAC asks its size
++			 * (property, 4 bytes) and then uses it with ACMEncryptDataEx to wrap the new passcode as an
++			 * "extractable password" (0x207b35aac; a size of 0 failed that as "Failed to obtain encryption size
++			 * -3"). Made on first use: 32 random bytes, kept with the context.
++			 */
++			c->data[slot].used = true;
++			c->data[slot].key = 13;
++			c->data[slot].len = 32;
++			memcpy(c->data[slot].v, key13(), 32);
++		}
++		/*
++		 * passcode10 (iOS 27.2): key 7 holds the new passcode as LocalAuthentication wrapped it with key 13
++		 * (ACMEncryptDataEx mode 2: 0x02 | IV16 | ciphertext | tag16, AES-256-GCM). profiled reads key 7 back and
++		 * takes it as the UTF-8 passcode (ManagedConfiguration+0x64734: NSString initWithBytes:length:encoding:4)
++		 * to check the profile's passcode rules: the SEP hands out the unwrapped bytes. Same here (tag not
++		 * checked). The plaintext only exists in this reply; nothing is logged or kept.
++		 */
++		uint8_t plain[64];
++		uint32_t plain_len = 0;
++		bool unwrapped = false;
++		/*
++		 * passcode11: only the short (25-byte payload) read gets the unwrapped passcode: profiled's. coreauthd
++		 * reads key 7 with a 34-byte payload to hand the wrapped blob to Preferences, which unwraps it itself
++		 * with key 13 (passcode10 gave it 4 bytes: "Failed to obtain plain data size -16" = 4 - 33).
++		 */
++		if (cmd == 41 && slot >= 0 && (key & 0xffff) == 7 && n < ACM_ID + 16 && c->data[slot].len >= 33 &&
++		    c->data[slot].v[0] == 2) {
++			if (!c->pwok) {
++				IOLockUnlock(gL);
++				snprintf(note, notesz, "key 7: wrapped passcode could not be unwrapped");
++				return ACM_ERR;
++			}
++			plain_len = c->pwlen;
++			memcpy(plain, c->pw, plain_len);
++			unwrapped = true;
++		}
++		if (unwrapped) {
++			if (sizeq && ocap >= 4) {
++				put32(o, plain_len);
++				*olen = 4;
++			} else if (ocap >= plain_len) {
++				memcpy(o, plain, plain_len);
++				*olen = plain_len;
++			}
++			bzero(plain, sizeof(plain));
++			IOLockUnlock(gL);
++			snprintf(note, notesz, "key 7: unwrapped passcode, %u bytes%s", plain_len, sizeq ? " (size)" : "");
++			return *olen ? r : ACM_NOT_FOUND;
++		}
++		if (sizeq && ocap >= 4) {
++			/*
++			 * passcode6 (iOS 27.2): a 4-byte answer is ACMContextGetDataProperty (LAC 0x207c438b4 -> GetData with
++			 * the property in the key's upper half), asked for key 13 on a fresh context when the new passcode is
++			 * turned into an "extractable password" credential. -7 there aborted Preferences ("Failed to create
++			 * extractable password ... Not found"). Answered 0 (the property of data that is not there).
++			 */
++			put32(o, slot >= 0 ? c->data[slot].len : 0);
++			*olen = 4;
++			IOLockUnlock(gL);
++			snprintf(note, notesz, "key 0x%x property -> %u", key, le32(o));
++			return r;
++		}
++		/*
++		 * passcode8: ContextGetData answers the bare bytes; the caller asks the size first (property, above)
++		 * and passes exactly that much room (key 13: out 0/32 -> passcode7's u32-length form did not fit -> -7).
++		 */
++		if (slot < 0 || ocap < c->data[slot].len) {
++			IOLockUnlock(gL);
++			snprintf(note, notesz, "key %u: not set (or room %u)", key, ocap);
++			return ACM_NOT_FOUND;
++		}
++		memcpy(o, c->data[slot].v, c->data[slot].len);
++		*olen = c->data[slot].len;
++		IOLockUnlock(gL);
++		snprintf(note, notesz, "key %u len %u returned", key, *olen);
++		return r;
++	}
++	case 25:                                /* GetEnvironmentVariable: u32 variable */
++		/*
++		 * guacamole (iOS 27.2): nothing is stored, so every variable is "not set". LocalAuthenticationCore's KVS
++		 * read (0x207ae6030) takes -7 as a nil value and -14 / anything else as an error; -3 failed every
++		 * coreauthd query (DTO enablement mode var 0x2b, context pool 0x45, ...) and with it the Stolen Device
++		 * Protection ratchet check that runs before "Set Passcode".
++		 */
++		if (n >= 4 && le32(p) == 0x45 && ocap >= 26) {
++			/*
++			 * passcode12 (iOS 27.2): var 0x45 = the context pools (LAC 0x207acfab0, 26 bytes, u16s): +0 all
++			 * contexts, +2 the disposable pool, +6 in use, +8 disposable in use -> [LACContextPool
++			 * initWithSize:(+0 - +8) used:+6] and initWithSize:+2 used:+8. Without it coreauthd thought the pool
++			 * full and invalidated the oldest context at every new one: the first entry of the new passcode
++			 * ("Invalidated due to exceeded number of allocated contexts" -> Preferences aborted on confirm).
++			 */
++			uint32_t used = 0;
++			IOLockLock(gL);
++			for (int i = 0; i < ACM_CTX_MAX; i++) {
++				used += gCtx[i].used ? 1 : 0;
++			}
++			IOLockUnlock(gL);
++			bzero(o, 26);
++			o[0] = ACM_CTX_MAX;             /* u16 little-endian */
++			o[2] = 16;
++			o[6] = (uint8_t)used;
++			*olen = 26;
++			snprintf(note, notesz, "var 0x45 (context pools) -> %u of %u in use", used, ACM_CTX_MAX);
++			return r;
++		}
++		snprintf(note, notesz, "var 0x%x -> not set", n >= 4 ? le32(p) : 0);
++		return ACM_NOT_FOUND;
++	case 51: {                              /* SEPControl: id16 | u32 | u32 len | data */
++		/*
++		 * guacamole (iOS 27.2): LACDTORatchetManager's state query (0x207b36c08) sends ACMSEPControl data
++		 * {1, 2, 0} and accepts only a 512-byte answer ("Failed to fetch ratchet state and config (stat: %d)"
++		 * otherwise, and the passcode change is refused before its keypad shows). All zero: ratchet not started,
++		 * Stolen Device Protection off. Other SEPControl requests stay unsupported (logged with their data).
++		 */
++		uint32_t dl = n >= 24 ? le32(p + 20) : 0;
++		uint32_t w0 = n >= 28 ? le32(p + 24) : 0, w1 = n >= 32 ? le32(p + 28) : 0;
++		/*
++		 * passcode3: the answer is ACMLib's serialized parameter, u32 length + bytes (0x207c5253c reads the length
++		 * first; length 0 = no data). passcode2 sent 512 bare zero bytes: the length word read 0 -> "Ratchet
++		 * config-and-status payload anomaly (reason=1)" (0x207b12dac: 1 = empty, 2 = short, 3 = long) and coreauthd
++		 * then dereferenced the missing data (SIGSEGV far 0x120) at every start: Settings hung on it.
++		 */
++		if (dl == 12 && n >= 36 && w0 == 1 && w1 == 2 && ocap >= 4 + 512) {
++			bzero(o, 4 + 512);
++			put32(o, 512);
++			*olen = 4 + 512;
++			snprintf(note, notesz, "ratchet state query -> 512 zero bytes (not started, feature off)");
++			return r;
++		}
++		nUnsup++;
++		snprintf(note, notesz, "SEPControl len %u data %08x %08x unsupported", dl, w0, w1);
++		return ACM_ERR;
++	}
++	default:
++		nUnsup++;
++		return ACM_ERR;
++	}
++}
++
++class AppleCredentialManager : public IOService {
++	OSDeclareDefaultStructors(AppleCredentialManager);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleCredentialManager, IOService);
++
++bool
++AppleCredentialManager::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleCredentialManagerUserClient");
++	return true;
++}
++
++class AppleCredentialManagerUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleCredentialManagerUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleCredentialManagerUserClient, IOUserClient);
++
++IOReturn
++AppleCredentialManagerUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++/* descriptor copies are prepare()d (1194) */
++static bool
++md_copy(IOMemoryDescriptor *md, void *buf, uint32_t len, bool out)
++{
++	if (len == 0) {
++		return true;
++	}
++	if (md->prepare() != kIOReturnSuccess) {
++		return false;
++	}
++	IOByteCount k = out ? md->writeBytes(0, buf, len) : md->readBytes(0, buf, len);
++	md->complete();
++	return k == len;
++}
++
++IOReturn
++AppleCredentialManagerUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	char pn[32], note[112];
++	IOReturn r = kIOReturnSuccess;
++	uint32_t in_len = args->structureInputDescriptor != NULL ?
++	    (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
++	uint32_t out_cap = args->structureOutputDescriptor != NULL ?
++	    (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
++	uint32_t cmd = 0, olen = 0;
++	uint8_t *in = NULL, *out = NULL;
++	bool dump = false;
++	note[0] = 0;
++	proc_selfname(pn, (int)sizeof(pn));
++
++	if (sweet_pc_mode() == 0) {
++		r = kIOReturnNotPermitted;
++		snprintf(note, sizeof(note), "kern.sweet_passcode=0");
++		goto done;
++	}
++	if (selector == 1 || selector == 2) {
++		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++			args->scalarOutput[i] = 0;
++		}
++		goto done;
++	}
++	if (selector != 0) {
++		r = kIOReturnUnsupported;
++		goto done;
++	}
++	if (in_len < ACM_HDR || in_len > ACM_IO_MAX || out_cap > ACM_IO_MAX) {
++		r = ACM_ERR;
++		goto done;
++	}
++	in = (uint8_t *)IOMallocData(in_len);
++	out = out_cap ? (uint8_t *)IOMallocZeroData(out_cap) : NULL;
++	if (in == NULL || (out_cap && out == NULL)) {
++		r = kIOReturnNoMemory;
++		goto done;
++	}
++	if (args->structureInputDescriptor != NULL) {
++		if (!md_copy(args->structureInputDescriptor, in, in_len, false)) {
++			r = kIOReturnVMError;
++			goto done;
++		}
++	} else {
++		memcpy(in, args->structureInput, in_len);
++	}
++	if (le32(in) != ACM_MAGIC) {
++		r = ACM_ERR;
++		snprintf(note, sizeof(note), "bad magic 0x%08x", le32(in));
++		goto done;
++	}
++	cmd = in[4];
++	nCmds++;
++	r = acm_cmd(cmd, in + ACM_HDR, in_len - ACM_HDR, out, out_cap, &olen, note, sizeof(note));
++	dump = (cmd != 5 && r == ACM_ERR && note[0] == 0);
++	if (olen > 0) {
++		if (args->structureOutputDescriptor != NULL) {
++			if (md_copy(args->structureOutputDescriptor, out, olen, true)) {
++				args->structureOutputDescriptorSize = olen;
++			} else {
++				r = kIOReturnVMError;
++			}
++		} else {
++			memcpy(args->structureOutput, out, olen);
++			args->structureOutputSize = olen;
++		}
++	} else if (args->structureOutputDescriptor != NULL) {
++		args->structureOutputDescriptorSize = 0;
++	} else {
++		args->structureOutputSize = 0;
++	}
++	gLastCmd = cmd;
++	gLastRet = r;
++done:
++	if (selector != 0 || cmd >= 64 || gLogged[cmd]++ < 40 || r != kIOReturnSuccess || (gLogged[cmd] % 100) == 0) {
++		char hx[3 * 24 + 1];
++		hx[0] = 0;
++		if (dump && in != NULL) {
++			uint32_t k = in_len - ACM_HDR < 24 ? in_len - ACM_HDR : 24;
++			for (uint32_t i = 0; i < k; i++) {
++				snprintf(hx + 3 * i, 4, "%02x ", in[ACM_HDR + i]);
++			}
++		}
++		SAY("%s sel %u cmd %u(%s) arg %u in %u out %u/%u -> 0x%x %s%s%s\n", pn, selector, cmd, acm_name(cmd),
++		    in != NULL && in_len >= ACM_HDR ? in[6] : 0, in_len, olen, out_cap, r, note, hx[0] ? " | " : "", hx);
++	}
++	if (in != NULL) {
++		bzero(in, in_len);              /* may hold a passphrase */
++		IOFreeData(in, in_len);
++	}
++	if (out != NULL) {
++		IOFreeData(out, out_cap);
++	}
++	return r;
++}
++
++/* ---- publish (once; never withdrawn: at mode 0 calls are refused) ---- */
++extern "C" void
++sweet_acm_publish(void)
++{
++	if (!OSCompareAndSwap(0, 1, &gPublished)) {
++		return;
++	}
++	gL = IOLockAlloc();
++	IOService *res = IOService::getResourceService();
++	AppleCredentialManager *s = OSTypeAlloc(AppleCredentialManager);
++	if (gL == NULL || res == NULL || s == NULL || !s->init()) {
++		SAY("publish failed (alloc)\n");
++		OSSafeReleaseNULL(s);
++		return;
++	}
++	if (!s->attach(res)) {
++		s->release();
++		SAY("publish failed (attach)\n");
++		return;
++	}
++	if (!s->start(res)) {
++		s->detach(res);
++		s->release();
++		SAY("publish failed (start)\n");
++		return;
++	}
++	s->registerService();
++	SAY("AppleCredentialManager published (user client AppleCredentialManagerUserClient)\n");
++}
++
++/*
++ * Kernel-only: SweetMesa calls this for a match that keymaster verified (1192 6.4) and only with
++ * kern.sweet_mesa_match=1. It arms one BiometryMatched credential for ACM_BIO_ARM_S seconds.
++ * No userland path reaches it. (No caller in 1195.)
++ */
++extern "C" /*
++ * passcode15 (iOS 27.2): profiled changes the passcode with MKBKeyBagChangeSystemSecretWithACM, so keybagd hands
++ * AppleKeyStore (aks_change_secret) the 16-byte ACM context id instead of the passcode: the real kext asks the SEP
++ * for that context's passcode (data key 7, wrapped with the context's key 13). passcode14 stored a verifier of the
++ * 16 id bytes, so the 4 typed digits from SpringBoard (sel 9) never matched. A 16-byte secret that names a live
++ * context is replaced by the context's passcode (empty when key 7 is empty: "no old passcode").
++ * Returns 1 when resolved (buf/len replaced), 0 when buf is not a context id (left as is).
++ */
++int
++sweet_acm_resolve_secret(uint8_t *buf, uint32_t *len, uint32_t cap, int *ctxno)
++{
++	static const uint8_t zero[ACM_ID] = { 0 };
++	if (gL == NULL || *len != ACM_ID || memcmp(buf, zero, ACM_ID) == 0) {
++		return 0;
++	}
++	IOLockLock(gL);
++	acm_ctx *c = ctx_find(buf);
++	if (c == NULL || c == &gGlobal) {
++		IOLockUnlock(gL);
++		return 0;
++	}
++	int k7 = -1;
++	for (int i = 0; i < 4; i++) {
++		if (c->data[i].used && (c->data[i].key & 0xffff) == 7) {
++			k7 = i;
++		}
++	}
++	uint32_t n = 0;
++	if (k7 >= 0 && c->pwok && c->pwlen <= cap) {
++		n = c->pwlen;
++		memcpy(buf, c->pw, n);
++	} else if (k7 >= 0 && c->data[k7].len <= cap && !(c->data[k7].len > 0 && c->data[k7].v[0] == 2)) {
++		n = c->data[k7].len;            /* unwrapped (or empty) */
++		memcpy(buf, c->data[k7].v, n);
++	} else if (k7 >= 0) {
++		IOLockUnlock(gL);
++		*ctxno = -1;                    /* wrapped but no key: cannot resolve */
++		return 0;
++	}
++	*ctxno = (int)c->serial;
++	IOLockUnlock(gL);
++	*len = n;
++	return 1;
++}
++
++void
++sweet_acm_note_verified_match(void)
++{
++	if (gL == NULL) {
++		return;
++	}
++	IOLockLock(gL);
++	gBioArmedAt = acm_now();
++	IOLockUnlock(gL);
++	SAY("verified biometric match armed for %d s\n", ACM_BIO_ARM_S);
++}
++
++static int
++sysctl_sweet_acm_state(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2,
++    struct sysctl_req *req)
++{
++	char b[320];
++	int live = 0;
++	for (int i = 0; i < ACM_CTX_MAX; i++) {
++		live += gCtx[i].used;
++	}
++	snprintf(b, sizeof(b), "published=%u cmds=%u unsup=%u contexts=%u live=%d pass_ok=%u pass_bad=%u bio_ok=%u "
++	    "bio_refused=%u refused=%u policy_yes=%u policy_no=%u last=%u(%s)->0x%x",
++	    gPublished, nCmds, nUnsup, nCtx, live, nPassOk, nPassBad, nBioOk, nBioRefused, nRefused, nPolicyYes,
++	    nPolicyNo, gLastCmd, acm_name(gLastCmd), gLastRet);
++	return SYSCTL_OUT(req, b, strlen(b) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_acm_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_acm_state, "A", "redfin 1195: SweetACM counters");
++#endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetACMGCM.h b/iokit/Kernel/arm/SweetACMGCM.h
+new file mode 100644
+index 0000000..6a5d885
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetACMGCM.h
+@@ -0,0 +1,179 @@
++/*
++ * passcode10: AES-256-GCM decryption without the tag check (only the counter-mode part), for the passcode that
++ * LocalAuthentication wraps with ACMEncryptDataEx mode 2 under a context's key-13 data: 0x02, 16-byte IV,
++ * ciphertext, 16-byte tag (LAC 0x207c52d78). This kernel has no corecrypto AES. Encryption direction of AES only.
++ */
++static const uint8_t gcm_sbox[256] = {
++	0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
++	0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
++	0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
++	0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
++	0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
++	0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
++	0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
++	0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
++	0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
++	0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
++	0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
++	0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
++	0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
++	0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
++	0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
++	0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
++};
++
++static uint8_t
++gcm_xt(uint8_t x)
++{
++	return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1b : 0));
++}
++
++/* AES-256 key schedule: 15 round keys */
++static void
++gcm_expand(const uint8_t key[32], uint8_t rk[240])
++{
++	uint8_t rcon = 1;
++	memcpy(rk, key, 32);
++	for (int i = 8; i < 60; i++) {
++		uint8_t t[4];
++		memcpy(t, rk + 4 * (i - 1), 4);
++		if (i % 8 == 0) {
++			uint8_t a = t[0];
++			t[0] = gcm_sbox[t[1]] ^ rcon;
++			t[1] = gcm_sbox[t[2]];
++			t[2] = gcm_sbox[t[3]];
++			t[3] = gcm_sbox[a];
++			rcon = gcm_xt(rcon);
++		} else if (i % 8 == 4) {
++			for (int j = 0; j < 4; j++) {
++				t[j] = gcm_sbox[t[j]];
++			}
++		}
++		for (int j = 0; j < 4; j++) {
++			rk[4 * i + j] = rk[4 * (i - 8) + j] ^ t[j];
++		}
++	}
++}
++
++static void
++gcm_block(const uint8_t rk[240], const uint8_t in[16], uint8_t out[16])
++{
++	uint8_t s[16], t[16];
++	for (int i = 0; i < 16; i++) {
++		s[i] = in[i] ^ rk[i];
++	}
++	for (int r = 1; r <= 14; r++) {
++		for (int i = 0; i < 16; i++) {          /* SubBytes + ShiftRows */
++			t[i] = gcm_sbox[s[(i + 4 * (i % 4)) % 16]];
++		}
++		if (r < 14) {                           /* MixColumns */
++			for (int c = 0; c < 4; c++) {
++				uint8_t *a = t + 4 * c, a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3], x = a0 ^ a1 ^ a2 ^ a3;
++				a[0] ^= x ^ gcm_xt(a0 ^ a1);
++				a[1] ^= x ^ gcm_xt(a1 ^ a2);
++				a[2] ^= x ^ gcm_xt(a2 ^ a3);
++				a[3] ^= x ^ gcm_xt(a3 ^ a0);
++			}
++		}
++		for (int i = 0; i < 16; i++) {
++			s[i] = t[i] ^ rk[16 * r + i];
++		}
++	}
++	memcpy(out, s, 16);
++}
++
++/* x = x * y in GF(2^128), GCM bit order */
++static void
++gcm_mul(uint8_t x[16], const uint8_t y[16])
++{
++	uint8_t z[16] = { 0 }, v[16];
++	memcpy(v, y, 16);
++	for (int i = 0; i < 128; i++) {
++		if (x[i / 8] & (0x80 >> (i % 8))) {
++			for (int j = 0; j < 16; j++) {
++				z[j] ^= v[j];
++			}
++		}
++		int lsb = v[15] & 1;
++		for (int j = 15; j > 0; j--) {
++			v[j] = (uint8_t)((v[j] >> 1) | (v[j - 1] << 7));
++		}
++		v[0] >>= 1;
++		if (lsb) {
++			v[0] ^= 0xe1;
++		}
++	}
++	memcpy(x, z, 16);
++}
++
++/* in = 16-byte IV | ciphertext (n bytes; the tag is not read). out = n bytes of plaintext. */
++static void
++gcm_decrypt16(const uint8_t key[32], const uint8_t *iv, const uint8_t *ct, size_t n, uint8_t *out)
++{
++	uint8_t rk[240], h[16] = { 0 }, j0[16], blk[16], len[16] = { 0 };
++	gcm_expand(key, rk);
++	gcm_block(rk, h, h);
++	memcpy(j0, iv, 16);                             /* J0 = GHASH(IV || 0^64 || [128]_64) */
++	gcm_mul(j0, h);
++	len[15] = 128;
++	for (int j = 0; j < 16; j++) {
++		j0[j] ^= len[j];
++	}
++	gcm_mul(j0, h);
++	for (size_t off = 0; off < n; off += 16) {
++		for (int j = 15; j >= 12; j--) {         /* inc32 */
++			if (++j0[j] != 0) {
++				break;
++			}
++		}
++		gcm_block(rk, j0, blk);
++		for (size_t j = 0; j < 16 && off + j < n; j++) {
++			out[off + j] = ct[off + j] ^ blk[j];
++		}
++	}
++	bzero(rk, sizeof(rk));
++}
++
++/*
++ * passcode17: the same, with the tag checked (no AAD: LAC 0x207c52d78 never adds any). Returns 1 when the tag
++ * matches. Used to find which key LocalAuthentication wrapped with (HKDF salt = an ACM context id).
++ */
++static int
++gcm_open16(const uint8_t key[32], const uint8_t *iv, const uint8_t *ct, size_t n, const uint8_t tag[16],
++    uint8_t *out)
++{
++	uint8_t rk[240], h[16] = { 0 }, j0[16], ctr[16], blk[16], s[16] = { 0 };
++	gcm_expand(key, rk);
++	gcm_block(rk, h, h);
++	memcpy(j0, iv, 16);
++	gcm_mul(j0, h);
++	j0[15] ^= 128;                                  /* [128]_64 in the last byte */
++	gcm_mul(j0, h);
++	memcpy(ctr, j0, 16);
++	for (size_t off = 0; off < n; off += 16) {
++		for (int j = 15; j >= 12; j--) {
++			if (++ctr[j] != 0) {
++				break;
++			}
++		}
++		gcm_block(rk, ctr, blk);
++		for (size_t j = 0; j < 16 && off + j < n; j++) {
++			s[j] ^= ct[off + j];                    /* GHASH over the ciphertext, zero padded */
++			out[off + j] = ct[off + j] ^ blk[j];
++		}
++		gcm_mul(s, h);
++	}
++	uint64_t bits = (uint64_t)n * 8;                /* len(A) = 0 || len(C) */
++	for (int j = 0; j < 8; j++) {
++		s[15 - j] ^= (uint8_t)(bits >> (8 * j));
++	}
++	gcm_mul(s, h);
++	gcm_block(rk, j0, blk);
++	uint8_t d = 0;
++	for (int j = 0; j < 16; j++) {
++		d |= (uint8_t)(blk[j] ^ s[j] ^ tag[j]);
++	}
++	bzero(rk, sizeof(rk));
++	bzero(blk, sizeof(blk));
++	return d == 0;
++}
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index 8ddff88..517c9e8 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -25,6 +25,26 @@
+ #include <libkern/c++/OSString.h>
+ #include <sys/proc.h>
+ 
++/*
++ * 1195: passcode support (bsd/dev/sweet_passcode.c), only when kern.sweet_passcode != 0. At 0 every selector
++ * takes the switch below exactly as before. The passcode is an authentication gate, never a key: wrap/unwrap
++ * (10/11) ignore it and the file layer never sees a lock (design: passcode-acm-design-2026-11-18.md).
++ */
++extern "C" {
++#include <sys/errno.h>
++int sweet_pc_mode(void);
++int sweet_pc_is_set(void);
++void sweet_pc_aks_state(uint32_t *ss, uint32_t *sls, uint32_t *sfa, uint32_t *sb);
++int sweet_pc_check_user(uint64_t uaddr, uint32_t len, int unlock);
++int sweet_pc_check_kbuf(const uint8_t *pw, uint32_t len, int unlock);
++int sweet_pc_change_user(uint64_t old_ua, uint32_t old_len, uint64_t new_ua, uint32_t new_len);
++int sweet_pc_verify_packed_user(uint64_t ua, uint32_t len);
++void sweet_pc_lock(void);
++int sweet_pc_locked(void);
++void sweet_acm_publish(void);
++void sweet_aks_notify(void);
++}
++
+ /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
+ enum {
+ 	kAKSOpen             = 0,
+@@ -55,9 +75,22 @@ enum {
+ 
+ /*
+  * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
+- * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
++ * (MobileKeyBag MKBDeviceUnlockedSinceBoot), bit 1 "no passcode"; clear
++ * lock bits = unlocked. 0910 (after sailfish 0180): with only bit 2 and lock
++ * state 0, coreduetd asked thousands of times a minute; answer no passcode,
++ * lock state disabled (HackiOS MiniAppleKeyStore.cpp does the same).
++ */
++#define SWEET_AKS_LOCK_STATE    0x6
++
++/*
++ * 1196: keybag status events. MobileKeyBag's MKBEventsRegister (SpringBoard's SBFMobileKeyBag, Preferences, ...)
++ * adds an IOGeneralInterest notification on AppleKeyStore; aksNotificationCB maps message 0xe3ffd00d to
++ * "keybag status changed" (SpringBoard re-reads the lock state, hasPasscodeSet) and 0xe3ffd00f to "first
++ * unlock". Without it SpringBoard kept its boot-time "no passcode" state: it never called aks_lock_device and
++ * the lock screen never asked. Sent only by sweet_passcode.c (passcode set/removed, lock, unlock, mode change).
+  */
+-#define SWEET_AKS_LOCK_STATE    0x4
++#define SWEET_AKS_MSG_STATUS    0xe3ffd00du
++static IOService *gAKS;
+ 
+ class AppleKeyStore : public IOService {
+ 	OSDeclareDefaultStructors(AppleKeyStore);
+@@ -75,8 +108,12 @@ AppleKeyStore::start(IOService *provider)
+ 		return false;
+ 	}
+ 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
++	gAKS = this;
+ 	registerService();
+ 	IOLog("SWEET AKS: AppleKeyStore registered (no passcode, unlocked)\n");
++	if (sweet_pc_mode() != 0) {
++		sweet_acm_publish();    /* 1195: boot-arg sweetpasscode=1..3 */
++	}
+ 	return true;
+ }
+ 
+@@ -107,7 +144,15 @@ sweet_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t
+ 		if (len > args->structureOutputDescriptor->getLength()) {
+ 			return kIOReturnNoSpace;
+ 		}
+-		args->structureOutputDescriptor->writeBytes(0, buf, len);
++		/* descriptor must be wired before writeBytes (passcode14) */
++		if (args->structureOutputDescriptor->prepare() != kIOReturnSuccess) {
++			return kIOReturnVMError;
++		}
++		IOByteCount k = args->structureOutputDescriptor->writeBytes(0, buf, len);
++		args->structureOutputDescriptor->complete();
++		if (k != len) {
++			return kIOReturnVMError;
++		}
+ 		args->structureOutputDescriptorSize = len;
+ 		return kIOReturnSuccess;
+ 	}
+@@ -150,7 +195,7 @@ sweet_aks_device_state(IOExternalMethodArguments *args)
+ 		const char *key;
+ 		uint8_t value;
+ 	} fields[] = {
+-		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
++		{ "ss", SWEET_AKS_LOCK_STATE }, { "sls", 3 }, { "sb", 0 }, { "sfa", 0 },
+ 		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+ 	};
+ 	uint8_t buf[128];
+@@ -170,6 +215,227 @@ sweet_aks_struct_out_size(IOExternalMethodArguments *args)
+ 	       (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
+ }
+ 
++extern "C" void
++sweet_aks_notify(void)
++{
++	if (gAKS != NULL) {
++		gAKS->messageClients(SWEET_AKS_MSG_STATUS);
++	}
++}
++
++/* ---- 1195: passcode-mode selectors (kern.sweet_passcode != 0) ---- */
++enum {
++	kAKSLockDevice       = 8,       /* aks_lock_device (32 = lock now) */
++	kAKSChangeSecret     = 15,      /* aks_change_secret(_se): 11 scalars */
++	kAKSGeneration       = 40,
++	kAKSVerifyPassword   = 42,      /* packed struct, item 0 = passcode */
++	kAKSLockDeviceNow    = 32,
++	kAKSChangeSecretEpilogue = 105,
++};
++#define SWEET_AKS_BAD_PASSCODE  ((IOReturn)0xe007c008)  /* MobileKeyBag -> -14; SEP status -8 */
++
++static IOReturn
++pc_ret(int e)
++{
++	switch (e) {
++	case 0:
++		return kIOReturnSuccess;
++	case EAUTH:
++		return SWEET_AKS_BAD_PASSCODE;
++	case EBUSY:
++		return kIOReturnNotPermitted;   /* backoff */
++	case EFAULT:
++	case EINVAL:
++		return kIOReturnBadArgument;
++	default:
++		return kIOReturnError;
++	}
++}
++
++/* SEQUENCE { UTF8String key, INTEGER value } with a minimal two's-complement INTEGER (0..2^31). */
++static uint32_t
++pc_der_pair(uint8_t *p, const char *key, uint32_t value)
++{
++	uint8_t iv[5];
++	uint32_t il = 0, klen = (uint32_t)strlen(key), n = 0;
++	for (int sh = 24; sh >= 0; sh -= 8) {
++		uint8_t b = (uint8_t)(value >> sh);
++		if (il == 0 && b == 0 && sh > 0) {
++			continue;
++		}
++		if (il == 0 && (b & 0x80)) {
++			iv[il++] = 0;
++		}
++		iv[il++] = b;
++	}
++	p[n++] = 0x30;
++	p[n++] = (uint8_t)(2 + klen + 2 + il);
++	p[n++] = 0x0c;
++	p[n++] = (uint8_t)klen;
++	memcpy(p + n, key, klen);
++	n += klen;
++	p[n++] = 0x02;
++	p[n++] = (uint8_t)il;
++	memcpy(p + n, iv, il);
++	return n + il;
++}
++
++static IOReturn
++pc_device_state(IOExternalMethodArguments *args)
++{
++	uint32_t ss, sls, sfa, sb;
++	sweet_pc_aks_state(&ss, &sls, &sfa, &sb);
++	const struct {
++		const char *key;
++		uint32_t value;
++	} fields[] = {
++		{ "ss", ss }, { "sls", sls }, { "sb", sb }, { "sfa", sfa },
++		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
++	};
++	uint8_t buf[160];
++	uint32_t n = 2;
++	for (unsigned int i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
++		n += pc_der_pair(buf + n, fields[i].key, fields[i].value);
++	}
++	buf[0] = 0x31;
++	buf[1] = (uint8_t)(n - 2);
++	return sweet_aks_struct_out(args, buf, n);
++}
++
++/* aks_pack_data: u32 count, then per item u32 len + data padded to 4. Item 0 = passcode. */
++static IOReturn
++pc_verify_packed(IOExternalMethodArguments *args)
++{
++	uint8_t buf[512];
++	uint32_t len;
++	if (args->structureInputDescriptor == NULL && args->structureInputSize == 0 && args->scalarInputCount >= 4) {
++		/* passcode19: iOS 27 passes the packed buffer by address (scalars 2, 3); see sweet_passcode.c */
++		return pc_ret(sweet_pc_verify_packed_user(args->scalarInput[2], (uint32_t)args->scalarInput[3]));
++	}
++	if (args->structureInputDescriptor != NULL) {
++		len = (uint32_t)args->structureInputDescriptor->getLength();
++		if (len > sizeof(buf) || args->structureInputDescriptor->prepare() != kIOReturnSuccess) {
++			return kIOReturnBadArgument;
++		}
++		args->structureInputDescriptor->readBytes(0, buf, len);
++		args->structureInputDescriptor->complete();
++	} else {
++		len = args->structureInputSize;
++		if (args->structureInput == NULL || len > sizeof(buf)) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(buf, args->structureInput, len);
++	}
++	IOReturn r = kIOReturnBadArgument;
++	uint32_t cnt, ilen;
++	if (len >= 8) {
++		memcpy(&cnt, buf, 4);
++		memcpy(&ilen, buf + 4, 4);
++		if (cnt >= 1 && ilen <= len - 8) {
++			r = pc_ret(sweet_pc_check_kbuf(buf + 8, ilen, 0));
++		}
++	}
++	bzero(buf, sizeof(buf));
++	return r;
++}
++
++/* true = handled here (ret set); false = take the existing switch. */
++static bool
++sweet_aks_pc(uint32_t selector, IOExternalMethodArguments *args, IOReturn *ret, bool *logall)
++{
++	uint32_t ns = args->scalarInputCount, no = args->scalarOutputCount;
++	const uint64_t *in = args->scalarInput;
++	*logall = true;
++	switch (selector) {
++	case kAKSGetLockState: {
++		uint32_t ss, sls, sfa, sb;
++		*logall = false;
++		if (no < 1) {
++			*ret = kIOReturnBadArgument;
++			return true;
++		}
++		sweet_pc_aks_state(&ss, &sls, &sfa, &sb);
++		args->scalarOutput[0] = ss;
++		args->scalarOutputCount = 1;
++		*ret = kIOReturnSuccess;
++		return true;
++	}
++	case kAKSGetDeviceState:
++	case kAKSGetExtDeviceState:
++		*logall = false;
++		args->scalarOutputCount = 0;
++		*ret = pc_device_state(args);
++		return true;
++	case kAKSLockDevice:
++	case kAKSLockDeviceNow:
++		sweet_pc_lock();
++		args->scalarOutputCount = 0;
++		*ret = kIOReturnSuccess;
++		return true;
++	case kAKSUnlockDevice:
++		args->scalarOutputCount = 0;
++		*ret = ns >= 3 ? pc_ret(sweet_pc_check_user(in[1], (uint32_t)in[2], 1)) : kIOReturnBadArgument;
++		return true;
++	case kAKSUnlockBag:
++		if (ns < 3 || in[0] != SWEET_AKS_SYSTEM_HANDLE) {
++			return false;   /* other bags: as before */
++		}
++		args->scalarOutputCount = 0;
++		*ret = pc_ret(sweet_pc_check_user(in[1], (uint32_t)in[2], 0));
++		return true;
++	case kAKSChangeSecret:
++		if (ns < 7) {
++			*ret = kIOReturnBadArgument;
++			return true;
++		}
++		*ret = pc_ret(sweet_pc_change_user(in[3], (uint32_t)in[4], in[5], (uint32_t)in[6]));
++		if (no >= 1) {
++			/*
++			 * passcode13 (iOS 27.2): keybagd changes a non-SE passcode "two phase": the output is the handle of
++			 * a temporary bag with the new secret, which it then commits and unloads; 0 is refused ("KBChange
++			 * SystemNonSeSecret: temp handle is invalid: 0" -> "Failed to set new passcode"). Any other handle
++			 * is accepted here (the bag selectors ignore handles).
++			 */
++			args->scalarOutput[0] = *ret == kIOReturnSuccess ? 0x51 : 0;
++			args->scalarOutputCount = 1;
++		}
++		return true;
++	case kAKSChangeSecretEpilogue:
++	case kAKSGeneration:
++		for (uint32_t i = 0; i < no; i++) {
++			args->scalarOutput[i] = 0;
++		}
++		*ret = kIOReturnSuccess;
++		return true;
++	case kAKSAssertHold:
++		/*
++		 * 1197: a lock assertion (aks_assert_hold) keeps an *unlocked* bag unlocked; real AKS refuses it while
++		 * the bag is locked. SpringBoard's grace-period assertion (SBFAuthenticationAssertionTracker ->
++		 * MKBDeviceLockAssertion, sel 26 type 2) right after aks_lock_device decides "authenticated": our
++		 * old blanket success meant the lock screen never asked. Locked -> refused; unlocked -> as before.
++		 */
++		if (!sweet_pc_locked()) {
++			return false;
++		}
++		args->scalarOutputCount = 0;
++		*ret = kIOReturnNotPermitted;
++		return true;
++	case kAKSAssertDrop:
++		return false;   /* as before, but logged every time in passcode mode */
++	case kAKSVerifyPassword:
++		args->scalarOutputCount = 0;
++		*ret = pc_verify_packed(args);
++		return true;
++	case kAKSSaveBag:
++		args->scalarOutputCount = 0;
++		*ret = sweet_aks_struct_out(args, "SWEETKB1", 8);
++		return true;
++	default:
++		*logall = false;
++		return false;
++	}
++}
++
+ IOReturn
+ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -183,7 +449,10 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	uint32_t out_struct = sweet_aks_struct_out_size(args);
+ 	uint64_t arg0 = in_scalars > 0 ? args->scalarInput[0] : 0;
+ 
+-	switch (selector) {
++	bool logall = false;
++	bool pc = sweet_pc_mode() != 0 && sweet_aks_pc(selector, args, &ret, &logall);
++
++	if (!pc) switch (selector) {
+ 	case kAKSOpen:
+ 	case kAKSUnloadBag:
+ 	case kAKSSetSystem:
+@@ -275,10 +544,13 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	static uint32_t logged[128];            /* a few lines per selector */
++	if (logall || selector >= 128 || logged[selector]++ < 5) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 3ffb266..7ad0c2c 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetIPAppender.cpp                             optional iokitc
+ iokit/Kernel/arm/SweetM2Scaler.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetACM.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetCamera.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp

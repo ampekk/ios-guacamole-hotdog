@@ -1,0 +1,228 @@
+--- a/xnu-12377/iokit/Kernel/arm/SweetM2Scaler.cpp
++++ b/xnu-12377/iokit/Kernel/arm/SweetM2Scaler.cpp
+@@ -19,6 +19,7 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <sys/proc.h>
+ #include "SweetSurface.h"
++#include <kern/clock.h>
+ 
+ class AppleM2ScalerCSCDriver : public IOService {
+     OSDeclareDefaultStructors(AppleM2ScalerCSCDriver);
+@@ -164,13 +165,92 @@
+     return true;
+ }
+ 
++/* 2026-11-19: a request whose destination is the source turned (W x H into H x W, both 32-bit RGB): QuartzCore's
++ * copy_iosurface in landscape (backboardd, 828x1792 -> 1792x828 about 65 times a second). Its rectangles are not
++ * decoded yet (they are nonzero); the whole surface is turned. Direction from kern.sweet_scaler_rot (bsd/dev/
++ * sweet_scaler.c): 1 clockwise (the source's top row becomes the right column), 2 counter-clockwise. Done in 32x32
++ * tiles so the column-wise reads stay in cache. */
++extern "C" {
++extern int sweet_scaler_rot;
++extern uint8_t sweet_scaler_last[0x170];
++extern char sweet_scaler_last_what[160];
++extern uint32_t sweet_scaler_last_n;
++extern uint64_t sweet_scaler_count_copied, sweet_scaler_count_rotated, sweet_scaler_count_refused, sweet_scaler_count_us;
++}
++
++static bool
++sweet_scaler_is32(SweetSurface *s)
++{
++    return s && (sweet_scaler_fourcc(s->pixelFormat, 'B','G','R','A') || sweet_scaler_fourcc(s->pixelFormat, 'R','G','B','A'));
++}
++
++static bool
++sweet_scaler_turned(SweetSurface *src, SweetSurface *dst)
++{
++    return sweet_scaler_is32(src) && sweet_scaler_is32(dst) && src->width && src->height &&
++        src->width != src->height && src->width == dst->height && src->height == dst->width;
++}
++
++static bool
++sweet_scaler_rotate(SweetSurface *src, SweetSurface *dst, int dir)
++{
++    if (dir != 1 && dir != 2) return false;
++    uintptr_t sb = src->kernelAddress(), db = dst->kernelAddress();
++    if (!sb || !db) return false;
++    uint32_t sw = src->width, sh = src->height, dw = dst->width, dh = dst->height;
++    uint32_t sp = src->bytesPerRow, dp = dst->bytesPerRow;
++    if (sw > 16384 || sh > 16384 || sp < sw * 4 || dp < dw * 4) return false;
++    uint64_t srcEnd = (uint64_t)(sh - 1) * sp + (uint64_t)sw * 4 + src->offset;
++    uint64_t dstEnd = (uint64_t)(dh - 1) * dp + (uint64_t)dw * 4 + dst->offset;
++    if (srcEnd > src->allocSize || dstEnd > dst->allocSize) return false;
++    const uint8_t *s = (const uint8_t *)sb + src->offset;
++    uint8_t *d = (uint8_t *)db + dst->offset;
++    bool swapRB = src->pixelFormat != dst->pixelFormat;
++    for (uint32_t ty = 0; ty < dh; ty += 32) {
++        for (uint32_t tx = 0; tx < dw; tx += 32) {
++            uint32_t ey = ty + 32 < dh ? ty + 32 : dh, ex = tx + 32 < dw ? tx + 32 : dw;
++            for (uint32_t y = ty; y < ey; y++) {
++                uint32_t *q = (uint32_t *)(d + (uint64_t)y * dp);
++                for (uint32_t x = tx; x < ex; x++) {
++                    /* clockwise: dst(x,y) = src(y, dw-1-x); counter-clockwise: dst(x,y) = src(dh-1-y, x) */
++                    uint32_t sx = dir == 1 ? y : dh - 1 - y;
++                    uint32_t sy = dir == 1 ? dw - 1 - x : x;
++                    uint32_t v = *(const uint32_t *)(s + (uint64_t)sy * sp + (uint64_t)sx * 4);
++                    if (swapRB) v = (v & 0xff00ff00u) | ((v >> 16) & 0xffu) | ((v & 0xffu) << 16);
++                    q[x] = v;
++                }
++            }
++        }
++    }
++    return true;
++}
++
++static void
++sweet_scaler_note(const uint8_t *in, const char *what, SweetSurface *src, SweetSurface *dst, uint32_t srcID, uint32_t dstID)
++{
++    bcopy(in, sweet_scaler_last, sizeof(sweet_scaler_last));
++    sweet_scaler_last_n++;
++    snprintf(sweet_scaler_last_what, sizeof(sweet_scaler_last_what), "%s src=%u %08x %ux%u rows %u dst=%u %08x %ux%u rows %u", what,
++        srcID, src ? src->pixelFormat : 0, src ? src->width : 0, src ? src->height : 0, src ? src->bytesPerRow : 0,
++        dstID, dst ? dst->pixelFormat : 0, dst ? dst->width : 0, dst ? dst->height : 0, dst ? dst->bytesPerRow : 0);
++}
++
+ IOReturn
+ AppleM2ScalerCSCDriverUserClient::externalMethod(uint32_t selector,
+     IOExternalMethodArguments *args, __unused IOExternalMethodDispatch *dispatch,
+     __unused OSObject *target, __unused void *reference)
+ {
+     if (selector != 1 || args == NULL || args->structureInput == NULL ||
+-        args->structureInputSize < 0x170) return kIOReturnBadArgument;
++        args->structureInputSize < 0x170) {
++        static uint32_t bad;
++        if (++bad <= 6) {
++            char name[32]; proc_selfname(name, sizeof(name));
++            IOLog("SWEET SCALER BAD #%u: %s selector=%u in=%u out=%u scalars=%u\n", bad, name, selector,
++                args ? (uint32_t)args->structureInputSize : 0, args ? (uint32_t)args->structureOutputSize : 0,
++                args ? args->scalarInputCount : 0);
++        }
++        return kIOReturnBadArgument;
++    }
+     const uint8_t *in = (const uint8_t *)args->structureInput;
+     uint32_t dstID = sweet_scaler_u32(in + 0);
+     uint32_t srcID = sweet_scaler_u32(in + 4);
+@@ -184,7 +264,21 @@
+         if (in[i] != 0) fullSurface = false;
+     SweetSurface *src = sweet_surface_copy(srcID);
+     SweetSurface *dst = sweet_surface_copy(dstID);
++    uint64_t began = mach_absolute_time();
++    bool rotated = false;
+     bool ok = fullSurface && sweet_scaler_convert(src, dst);
++    if (!ok && src && dst && sweet_scaler_turned(src, dst) && sweet_scaler_rot) {
++        rotated = ok = sweet_scaler_rotate(src, dst, sweet_scaler_rot);
++    }
++    if (ok) {
++        uint64_t ns;
++        absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++        sweet_scaler_count_us += ns / 1000;
++        if (rotated) sweet_scaler_count_rotated++; else sweet_scaler_count_copied++;
++    } else {
++        sweet_scaler_count_refused++;
++    }
++    if (!ok || rotated) sweet_scaler_note(in, ok ? "rotated" : "refused", src, dst, srcID, dstID);
+     if (sweet_scaler_log_count++ < 32) {
+         char name[32]; proc_selfname(name, sizeof(name));
+         IOLog("SWEET SCALER: %s selector=%u src=%u dst=%u size=%u srcfmt=%08x %ux%u dstfmt=%08x %ux%u srcrect=%08x,%08x,%08x,%08x dstrect=%08x,%08x,%08x,%08x -> %s\n",
+@@ -195,7 +289,29 @@
+             sweet_scaler_u32(in+0x30), sweet_scaler_u32(in+0x34),
+             sweet_scaler_u32(in+0x58), sweet_scaler_u32(in+0x5c),
+             sweet_scaler_u32(in+0x60), sweet_scaler_u32(in+0x64),
+-            ok ? "copied" : "unsupported");
++            rotated ? "rotated" : ok ? "copied" : "unsupported");
++    }
++    /* 2026-11-19: landscape games are black: QuartzCore's copy_iosurface sends IOSurfaceAcceleratorTransformSurface
++     * requests (rectangles set) every frame and gets kIOReturnUnsupported; the 32-line log above is spent by then.
++     * Every refused request is counted, and the first 6 (then every 1000th) are logged with the whole 0x170-byte
++     * request in hex, to decode the rectangle and rotation fields. */
++    if (!ok) {
++        static uint32_t refused;
++        uint32_t n = ++refused;
++        if (n <= 6 || n % 1000 == 0) {
++            char name[32]; proc_selfname(name, sizeof(name));
++            IOLog("SWEET SCALER REFUSED #%u: %s src=%u %08x %ux%u rows %u dst=%u %08x %ux%u rows %u full=%d size=%u\n",
++                n, name, srcID, src ? src->pixelFormat : 0, src ? src->width : 0, src ? src->height : 0,
++                src ? src->bytesPerRow : 0, dstID, dst ? dst->pixelFormat : 0, dst ? dst->width : 0,
++                dst ? dst->height : 0, dst ? dst->bytesPerRow : 0, fullSurface, (uint32_t)args->structureInputSize);
++            if (n <= 6) {
++                for (uint32_t o = 0; o < 0x170; o += 32) {
++                    IOLog("SWEET SCALER REFUSED #%u +%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", n, o,
++                        sweet_scaler_u32(in+o), sweet_scaler_u32(in+o+4), sweet_scaler_u32(in+o+8), sweet_scaler_u32(in+o+12),
++                        sweet_scaler_u32(in+o+16), sweet_scaler_u32(in+o+20), sweet_scaler_u32(in+o+24), sweet_scaler_u32(in+o+28));
++                }
++            }
++        }
+     }
+     if (args->structureOutput != NULL && args->structureOutputSize)
+         bzero(args->structureOutput, args->structureOutputSize);
+--- /dev/null
++++ b/xnu-12377/bsd/dev/sweet_scaler.c
+@@ -0,0 +1,64 @@
++/*
++ * sweet_scaler.c: sysctls for the CPU AppleM2ScalerCSCDriver stand-in (iokit/Kernel/arm/SweetM2Scaler.cpp).
++ * 2026-11-19 (ios-sweet, Claude): landscape games were black because backboardd's QuartzCore copies its portrait
++ * surface into landscape ones through the scaler (IOSurfaceAcceleratorTransformSurface, ~65 a second), which the
++ * stand-in refused.
++ *
++ *   kern.sweet_scaler_rot   (rw) how a request whose destination is the source turned (W x H -> H x W) is done:
++ *                           0 refuse (as before), 1 clockwise, 2 counter-clockwise (default 1)
++ *   kern.sweet_scaler_last  (r)  the latest refused or rotated request, 0x170 bytes in hex, with its surfaces
++ *   kern.sweet_scaler_stats (r)  counters
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#include <kern/kalloc.h>
++
++int sweet_scaler_rot = 1;
++uint8_t sweet_scaler_last[0x170];
++char sweet_scaler_last_what[160];
++uint32_t sweet_scaler_last_n;
++uint64_t sweet_scaler_count_copied, sweet_scaler_count_rotated, sweet_scaler_count_refused, sweet_scaler_count_us;
++
++SYSCTL_INT(_kern, OID_AUTO, sweet_scaler_rot, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_scaler_rot, 0,
++    "SweetM2Scaler: turned requests 0 refuse, 1 clockwise, 2 counter-clockwise");
++
++static int
++sysctl_sweet_scaler_last(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	const size_t cap = 2048;
++	char *s = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (s == NULL) {
++		return ENOMEM;
++	}
++	size_t n = (size_t)snprintf(s, cap, "#%u %s", sweet_scaler_last_n, sweet_scaler_last_what);
++	for (uint32_t o = 0; o < sizeof(sweet_scaler_last) && n + 16 < cap; o += 4) {
++		uint32_t v;
++		bcopy(sweet_scaler_last + o, &v, sizeof(v));
++		if (o % 32 == 0) {
++			n += (size_t)snprintf(s + n, cap - n, "\n+%03x:", o);
++		}
++		n += (size_t)snprintf(s + n, cap - n, " %08x", v);
++	}
++	int e = SYSCTL_OUT(req, s, strlen(s) + 1);
++	kfree_data(s, cap);
++	return e;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_scaler_last, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_sweet_scaler_last, "A",
++    "SweetM2Scaler: the latest refused or rotated request (hex)");
++
++static int
++sysctl_sweet_scaler_stats(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	char s[200];
++	uint64_t done = sweet_scaler_count_copied + sweet_scaler_count_rotated;
++	snprintf(s, sizeof(s), "copied %llu rotated %llu refused %llu | rot %d | avg %llu us per done request",
++	    sweet_scaler_count_copied, sweet_scaler_count_rotated, sweet_scaler_count_refused, sweet_scaler_rot,
++	    done ? sweet_scaler_count_us / done : 0);
++	return SYSCTL_OUT(req, s, strlen(s) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_scaler_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_sweet_scaler_stats, "A",
++    "SweetM2Scaler: counters");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/xnu-12377/bsd/conf/files
++++ b/xnu-12377/bsd/conf/files
+@@ (add after bsd/dev/sweet_abp.c) @@
++bsd/dev/sweet_scaler.c			standard

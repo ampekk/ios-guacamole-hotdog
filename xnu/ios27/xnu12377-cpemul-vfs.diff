@@ -1,0 +1,196 @@
+--- research/ios27.2/kernel-backup/vfs_syscalls.c.before-cpvol	2026-11-15 03:06:20.751936263 +0000
++++ work/xnu-12377/bsd/vfs/vfs_syscalls.c	2026-11-15 03:06:20.781775859 +0000
+@@ -81,6 +81,11 @@
+ #include <sys/stat.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/mount_internal.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET) && CONFIG_PROTECT
++extern uint32_t sweet_cp_emul_visflags(mount_t);   /* bsd/sweet_hfs/core/hfs_cprotect.c */
++#else
++#define sweet_cp_emul_visflags(mp) 0u
++#endif
+ #include <sys/proc_internal.h>
+ #include <sys/kauth.h>
+ #include <sys/uio_internal.h>
+@@ -3830,7 +3835,7 @@
+ 	sfs->f_fsid = vsfs->f_fsid;
+ 	sfs->f_owner = vsfs->f_owner;
+ 	sfs->f_type = mp->mnt_vtable->vfc_typenum;
+-	sfs->f_flags = mp->mnt_flag & MNT_VISFLAGMASK;
++	sfs->f_flags = (mp->mnt_flag & MNT_VISFLAGMASK) | sweet_cp_emul_visflags(mp);
+ 	sfs->f_fssubtype = vsfs->f_fssubtype;
+ 	sfs->f_flags_ext = vfs_getextflags(mp);
+ 	vfs_getfstypename(mp, sfs->f_fstypename, MFSTYPENAMELEN);
+@@ -14807,7 +14812,7 @@
+ 		struct user64_statfs sfs;
+ 		my_size = copy_size = sizeof(sfs);
+ 		bzero(&sfs, my_size);
+-		sfs.f_flags = mp->mnt_flag & MNT_VISFLAGMASK;
++		sfs.f_flags = (mp->mnt_flag & MNT_VISFLAGMASK) | sweet_cp_emul_visflags(mp);
+ 		sfs.f_type = (short)mp->mnt_vtable->vfc_typenum;
+ 		sfs.f_reserved1 = (short)sfsp->f_fssubtype;
+ 		sfs.f_bsize = (user64_long_t)sfsp->f_bsize;
+@@ -14833,7 +14838,7 @@
+ 		my_size = copy_size = sizeof(sfs);
+ 		bzero(&sfs, my_size);
+ 
+-		sfs.f_flags = mp->mnt_flag & MNT_VISFLAGMASK;
++		sfs.f_flags = (mp->mnt_flag & MNT_VISFLAGMASK) | sweet_cp_emul_visflags(mp);
+ 		sfs.f_type = (short)mp->mnt_vtable->vfc_typenum;
+ 		sfs.f_reserved1 = (short)sfsp->f_fssubtype;
+ 
+--- research/ios27.2/kernel-backup/vfs_attrlist.c.before-cpvol	2026-11-15 03:06:20.758769725 +0000
++++ work/xnu-12377/bsd/vfs/vfs_attrlist.c	2026-11-15 03:06:20.787395612 +0000
+@@ -40,6 +40,11 @@
+ #include <sys/syslog.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/mount_internal.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET) && CONFIG_PROTECT
++extern uint32_t sweet_cp_emul_visflags(mount_t);   /* bsd/sweet_hfs/core/hfs_cprotect.c */
++#else
++#define sweet_cp_emul_visflags(mp) 0u
++#endif
+ #include <sys/proc_internal.h>
+ #include <sys/file_internal.h>
+ #include <sys/kauth.h>
+@@ -1581,7 +1586,7 @@
+ 		ab.actual.volattr |= ATTR_VOL_NAME;
+ 	}
+ 	if (alp->volattr & ATTR_VOL_MOUNTFLAGS) {
+-		ATTR_PACK_CAST(&ab, uint32_t, mnt->mnt_flag);
++		ATTR_PACK_CAST(&ab, uint32_t, mnt->mnt_flag | sweet_cp_emul_visflags(mnt));
+ 		ab.actual.volattr |= ATTR_VOL_MOUNTFLAGS;
+ 	}
+ 	if (alp->volattr & ATTR_VOL_MOUNTEDDEVICE) {
+--- research/ios27.2/kernel-backup/vfs_subr.c.before-cpfile	2026-11-15 03:28:21.442419627 +0000
++++ work/xnu-12377/bsd/vfs/vfs_subr.c	2026-11-15 03:28:39.920689753 +0000
+@@ -100,6 +100,8 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vm.h>
+ #include <sys/xattr.h>
++#include <sys/cprotect.h>
++#include <sys/content_protection.h>
+ #include <sys/sysctl.h>
+ #include <sys/filedesc.h>
+ #include <sys/fcntl.h>
+@@ -141,6 +143,74 @@
+ 	vfs_name(mp, name);
+ 	return strncmp(name, "hfs", MFSNAMELEN) == 0 ? MNT_CPROTECT : 0;
+ }
++
++/*
++ * Per-file data protection classes on that same volume, emulated in VFS (SWEET HFS has no CONFIG_PROTECT, so
++ * hfs_vnop_getattr/setattr never handle va_dataprotect_class: F_GETPROTECTIONCLASS gave ENOTSUP and getattrlist
++ * left ATTR_CMN_DATA_PROTECT_FLAGS out even with MNT_CPROTECT shown - measured with userland/jb/urlprops).
++ * For the callers that see MNT_CPROTECT (non-root, sweet_cp_emul_visflags): a class set through VNOP_SETATTR
++ * (setattrlist, F_SETPROTECTIONCLASS, NSURL/NSFileManager) is kept in the xattr com.apple.sweet.cpclass (1 byte)
++ * and VNOP_GETATTR reports it, else class D (4) = NSFileProtectionNone, which is the truth (nothing is
++ * encrypted) and what PosterBoard's wallpaper store requires (PFPosterPathURLResourceValues). Called from
++ * kpi_vfs.c VNOP_GETATTR / VNOP_SETATTR, without filesystem locks held.
++ */
++#define SWEET_CP_XATTR  "com.apple.sweet.cpclass"
++
++static int
++sweet_cp_emul_vnode(vnode_t vp)
++{
++	return vp != NULL && (vnode_isreg(vp) || vnode_isdir(vp)) && sweet_cp_emul_visflags(vnode_mount(vp)) != 0;
++}
++
++void
++sweet_cp_emul_getattr(vnode_t vp, struct vnode_attr *vap, vfs_context_t ctx)
++{
++	if (!VATTR_IS_ACTIVE(vap, va_dataprotect_class) || VATTR_IS_SUPPORTED(vap, va_dataprotect_class) ||
++	    !sweet_cp_emul_vnode(vp)) {
++		return;
++	}
++	uint8_t b = 0;
++	size_t got = 0;
++	uint32_t cls = PROTECTION_CLASS_D;
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++	if (uio != NULL) {
++		uio_addiov(uio, CAST_USER_ADDR_T(&b), sizeof(b));
++		if (vn_getxattr(vp, SWEET_CP_XATTR, uio, &got, XATTR_NOSECURITY, ctx) == 0 && got == 1 &&
++		    cp_is_valid_class(vnode_isdir(vp), b)) {
++			cls = b;
++		}
++		uio_free(uio);
++	}
++	vap->va_dataprotect_class = cls;
++	VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
++}
++
++/* Before the filesystem: take the class out of vap (returns 1 when it did); after: sweet_cp_emul_setattr_done. */
++int
++sweet_cp_emul_setattr(vnode_t vp, struct vnode_attr *vap, vfs_context_t ctx)
++{
++	if (!VATTR_IS_ACTIVE(vap, va_dataprotect_class) || !sweet_cp_emul_vnode(vp)) {
++		return 0;
++	}
++	uint8_t b = (uint8_t)(vap->va_dataprotect_class & 0x1f);   /* the effective class, as HFS CP_CLASS() */
++	VATTR_CLEAR_ACTIVE(vap, va_dataprotect_class);
++	if (cp_is_valid_class(vnode_isdir(vp), b)) {
++		uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
++		if (uio != NULL) {
++			uio_addiov(uio, CAST_USER_ADDR_T(&b), sizeof(b));
++			(void)vn_setxattr(vp, SWEET_CP_XATTR, uio, XATTR_NOSECURITY, ctx);
++			uio_free(uio);
++		}
++	}
++	return 1;
++}
++
++void
++sweet_cp_emul_setattr_done(struct vnode_attr *vap)
++{
++	VATTR_SET_ACTIVE(vap, va_dataprotect_class);
++	VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
++}
+ #endif
+ 
+ #include <kern/assert.h>
+--- research/ios27.2/kernel-backup/kpi_vfs.c.before-cpfile	2026-11-15 03:28:21.448644713 +0000
++++ work/xnu-12377/bsd/vfs/kpi_vfs.c	2026-11-15 03:28:21.471882264 +0000
+@@ -83,6 +83,13 @@
+ #include <sys/kauth.h>
+ #include <sys/mount.h>
+ #include <sys/mount_internal.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET) && CONFIG_PROTECT
++#define SWEET_CP_EMUL 1
++extern void sweet_cp_emul_getattr(vnode_t, struct vnode_attr *, vfs_context_t);
++extern int sweet_cp_emul_setattr(vnode_t, struct vnode_attr *, vfs_context_t);
++extern void sweet_cp_emul_setattr_done(struct vnode_attr *);
++#endif
++
+ #include <sys/time.h>
+ #include <sys/disk.h>
+ #include <sys/vnode_internal.h>
+@@ -3902,6 +3909,11 @@
+ 
+ 	_err = (*vp->v_op[vnop_getattr_desc.vdesc_offset])(&a);
+ 	DTRACE_FSINFO(getattr, vnode_t, vp);
++#if SWEET_CP_EMUL
++	if (_err == 0) {
++		sweet_cp_emul_getattr(vp, vap, ctx);    /* vfs_subr.c */
++	}
++#endif
+ 
+ 	return _err;
+ }
+@@ -3929,9 +3941,17 @@
+ 	a.a_vp = vp;
+ 	a.a_vap = vap;
+ 	a.a_context = ctx;
++#if SWEET_CP_EMUL
++	int sweet_cp = sweet_cp_emul_setattr(vp, vap, ctx);     /* vfs_subr.c */
++#endif
+ 
+ 	_err = (*vp->v_op[vnop_setattr_desc.vdesc_offset])(&a);
+ 	DTRACE_FSINFO(setattr, vnode_t, vp);
++#if SWEET_CP_EMUL
++	if (sweet_cp) {
++		sweet_cp_emul_setattr_done(vap);
++	}
++#endif
+ 
+ #if CONFIG_APPLEDOUBLE
+ 	/*

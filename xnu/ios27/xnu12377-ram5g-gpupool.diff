@@ -1,0 +1,49 @@
+--- ../../research/ios27.2/kernel-backup/sweet_gpu.c.before-ram5g	2026-11-17 03:51:12.328950054 +0000
++++ bsd/dev/sweet_gpu.c	2026-11-17 04:22:38.285061297 +0000
+@@ -2608,11 +2608,26 @@
+  * 0147: the GPU supports 36-bit output addresses (TCR2 PASIZE). For this staged RAM-split test,
+  * do not allocate from the low 688 MiB; only the 2 GiB high aperture is available.
+  */
++/*
++ * 2026-11-17 (mkadt --ram5g): XNU now has 0x1_00000000-0x2_40000000 (5 GiB), so the pool keeps only the top 1 GiB of
++ * the high aperture and takes DDR XNU does not manage instead, ~2 GiB in all (2025 MiB):
++ *   0x2_40000000-0x2_80000000  1024 MiB, first (first fit prefers it)
++ *   0xc4000000-0xe0000000       448 MiB  (old low range; below it 0xc0000000-0xc4000000 stays unused)
++ *   0xe1000000-0xf0000000       240 MiB  (old low range; 0xe0000000 + 16 MB is wland's radio pool)
++ *   0xace00000-0xbbb00000       237 MiB  (low bank above mtp_mem, below the 0xbbb00000 DDR hole: no reservation)
++ *   0xa0000000-0xa4c00000        76 MiB  (low bank between bootloader_log_mem and cdsp_sec_regions)
++ * Untouched: 0xf0000000 (zap metadata), 0xfd800000.. (adspd's FastRPC heap, buffers, PCM), the cont-splash region.
++ * Boot-arg sweetgpuhigh=0 takes the first (high) range away.
++ */
+ static const struct { uint64_t start, end; } gpu_pool_ranges[] = {
+-	{ 0x200000000ull, 0x280000000ull },
++	{ 0x240000000ull, 0x280000000ull },
++	{ 0xc4000000ull, 0xe0000000ull },
++	{ 0xe1000000ull, 0xf0000000ull },
++	{ 0xace00000ull, 0xbbb00000ull },
++	{ 0xa0000000ull, 0xa4c00000ull },
+ };
+ #define GPU_POOL_RANGES   (sizeof(gpu_pool_ranges) / sizeof(gpu_pool_ranges[0]))
+-#define GPU_POOL_CHUNKS   ((0x280000000ull - 0x200000000ull) / GPU_POOL_CHUNK)
++#define GPU_POOL_CHUNKS   ((0x40000000ull + 0x1c000000ull + 0x0f000000ull + 0x0ed00000ull + 0x04c00000ull) / GPU_POOL_CHUNK)
+ static uint8_t gpu_pool_used[GPU_POOL_CHUNKS];
+ static uint64_t gpu_pool_free_bytes = GPU_POOL_CHUNKS * GPU_POOL_CHUNK;
+ static bool gpu_pool_ready;
+@@ -2640,13 +2655,13 @@
+ 	gpu_pool_ready = true;
+ 	uint32_t high = 1;
+ 	(void)PE_parse_boot_argn("sweetgpuhigh", &high, sizeof(high));
+-	uint64_t n = (gpu_pool_ranges[GPU_POOL_RANGES - 1].end - gpu_pool_ranges[GPU_POOL_RANGES - 1].start) /
+-	    GPU_POOL_CHUNK;
++	uint64_t n = (gpu_pool_ranges[0].end - gpu_pool_ranges[0].start) / GPU_POOL_CHUNK;
+ 	if (!high) {
+-		memset(&gpu_pool_used[GPU_POOL_CHUNKS - n], 1, n);
++		memset(&gpu_pool_used[0], 1, n);
+ 		gpu_pool_free_bytes -= n * GPU_POOL_CHUNK;
+ 	}
+-	printf("SWEET GPU: pool %llu MB%s\n", gpu_pool_free_bytes >> 20, high ? " (with 2 GB above XNU)" : "");
++	printf("SWEET GPU: pool %llu MB in %u ranges%s\n", gpu_pool_free_bytes >> 20, (unsigned)GPU_POOL_RANGES,
++	    high ? " (with 1 GB above XNU)" : "");
+ }
+ 
+ int

@@ -1,0 +1,41 @@
+--- ../../research/ios27.2/kernel-backup/SweetFramebuffer.cpp.before-canvas	2026-11-15 01:16:55.292156237 +0000
++++ iokit/Kernel/arm/SweetFramebuffer.cpp	2026-11-15 01:16:55.305528989 +0000
+@@ -338,7 +338,7 @@
+ 	}
+ 	return (uint32_t)us + 50;               /* just past the start */
+ }
+-#define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
++#define SWEET_FB_DOT_PITCH              (sweet_fb_logical_w == 1179 ? 460 : 458)     /* ppi: iPhone 14 Pro 460, iPhone X 458 */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+@@ -504,6 +504,29 @@
+ 		sweet_fb_logical_w = 828;
+ 		sweet_fb_logical_h = 1792;
+ 	}
++	/*
++	 * The presented size follows the ADT's /arm-io/disp0 canvas-width/height (mkadt.py writes the size of the
++	 * identity: 1125x2436 for d22, 1179x2556 for d73, 828x1792 with --scale2), the size CoreAnimation renders at
++	 * (MobileGestalt reads the same node). With the fixed 1125x2436 an iOS 27 (d73) frame of 1179x2556 lost its
++	 * right 54 and bottom 120 pixels. Boot-arg sweetfb_canvas=0 keeps the fixed sizes above.
++	 */
++	uint32_t useCanvas = 1;
++	(void)PE_parse_boot_argn("sweetfb_canvas", &useCanvas, sizeof(useCanvas));
++	if (useCanvas && provider != NULL) {
++		OSData *cw = OSDynamicCast(OSData, provider->getProperty("canvas-width"));
++		OSData *ch = OSDynamicCast(OSData, provider->getProperty("canvas-height"));
++		uint32_t w = 0, h = 0;
++		if (cw != NULL && ch != NULL && cw->getLength() >= 4 && ch->getLength() >= 4) {
++			bcopy(cw->getBytesNoCopy(), &w, 4);
++			bcopy(ch->getBytesNoCopy(), &h, 4);
++		}
++		if (w >= 320 && h >= 480 && w <= 4096 && h <= 4096) {
++			sweet_fb_logical_w = w;
++			sweet_fb_logical_h = h;
++		} else {
++			IOLog("SWEET FB: no usable canvas-width/height on %s (%u x %u): fixed size\n", provider->getName(), w, h);
++		}
++	}
+ 	IOLog("SWEET FB: presented screen %ux%u (@%ux, 0240)\n", sweet_fb_logical_w, sweet_fb_logical_h, pscale == 2 ? 2u : 3u);
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;

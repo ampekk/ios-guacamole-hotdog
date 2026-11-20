@@ -1,0 +1,249 @@
+--- a/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
++++ b/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+@@ -938,6 +938,8 @@
+  {std::lock_guard<std::mutex> hold(lock);if(!seen.insert(key).second)return [NSMethodSignature signatureWithObjCTypes:"@@:"];}
+  if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
+  noteProblem([NSString stringWithFormat:@"missing %s (answered nil)",key.c_str()]);
++ // 2026-11-19: also to stderr (with dump-cb on, the dump file): Minecraft's vertex and index buffers stay empty with no refusal.
++ if(logToStderr())fprintf(stderr,"%s: native-metal: missing selector %s (answered as a no-op)\n",getprogname(),key.c_str());
+  return [NSMethodSignature signatureWithObjCTypes:"@@:"];
+ }
+ // The objects declare their Metal protocols, so a selector they lack can come with the protocol's own signature: a void method takes
+@@ -1053,6 +1055,11 @@
+ - (id<MTLHeap>)heap {return _parentHeap;} \
+ - (int)setOwnerWithIdentity:(unsigned)identity {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} \
+ - (void)waitUntilComplete {waitForResource(self);}
++// 2026-11-19 (Minecraft's vertex buffer reads all zero): the large buffers the app took a CPU pointer for, scanned every 50th commit
++// while dump-cb is on (watchBuffersAtCommit); a change in a buffer's nonzero words goes to stderr (the dump file).
++static NSHashTable *gWatchedBuffers;
++// Read on first use: the plugin sets NATIVE_METAL_DUMP_CB in its own start, after static initializers ran.
++static bool bufferDiagnostics() {static const bool on=getenv("NATIVE_METAL_DUMP_CB")!=nullptr;return on;}
+ @interface NBBuffer : NBObject
+ @property(nonatomic) NmbBuffer *handle;
+ @property(nonatomic) MTLResourceOptions options;
+@@ -1061,6 +1068,15 @@
+ @property(nonatomic) NSUInteger heapOffset;
+ // A surface import's own surface object, which the runtime buffer retains until it is freed (surfaceBuffer); nullptr otherwise.
+ @property(nonatomic) IOSurfaceRef importedSurface;
++// 2026-11-19 (dump-cb diagnostics, Minecraft's empty vertex buffers): the call that made it, and how often the app asked for its CPU
++// pointer, its GPU address and didModifyRange.
++@property(nonatomic) const char *madeBy;
++@property(atomic) uint32_t contentsCalls,gpuAddressCalls,modifyCalls;
++@property(atomic) void *firstContents,*lastContents;   // the CPU pointers it answered first and last (a moved buffer differs)
++@property(atomic) uint32_t contentsChanges;           // how often the answer differed from the one before
++@property(atomic) int64_t watchedNonzero;             // the nonzero words the buffer watch last saw (-1: not yet)
++@property(nonatomic) void *cachedContents;            // -contents after its first non-null answer
++- (void)noteContents:(void *)p;
+ @end
+ @interface NBTexture : NBObject
+ @property(nonatomic) NmbTexture *handle;
+@@ -1102,13 +1118,33 @@
+ }
+ - (BOOL)purgeHold:(BOOL)hold {if(hold)return nmb_buffer_hold(_handle);nmb_buffer_unhold(_handle);return NO;}
+ - (NSUInteger)length {return nmb_buffer_length(_handle);}
+-- (void *)contents {return nmb_buffer_contents(_handle);}
+-- (uint64_t)gpuAddress {return nmb_buffer_gpu_address(_handle);}
++- (void *)contents {
++ // 2026-11-19: the pointer is the buffer's for its life (the bridge pins it on the first answer), so it is answered from a copy after
++ // that: Minecraft asks before every uniform update, and each bridge call (a Rust guard, a lock, the pin) was about a quarter of its
++ // render thread. The counters and the buffer watch run only with dump-cb on.
++ if(void *p=_cachedContents){if(bufferDiagnostics())[self noteContents:p];return p;}
++ void *p=nmb_buffer_contents(_handle);
++ if(p)_cachedContents=p;
++ if(bufferDiagnostics())[self noteContents:p];
++ return p;
++}
++- (void)noteContents:(void *)p {
++ self.contentsCalls++;
++ // dump-cb on: buffers of 1 MiB and more that the app takes a CPU pointer for are watched (watchBuffersAtCommit).
++ if(self.contentsCalls==1 && nmb_buffer_length(_handle)>=(1u<<20)) {
++  static NSHashTable *watched;static std::mutex lock;std::lock_guard<std::mutex> guard(lock);
++  if(!watched)watched=[NSHashTable weakObjectsHashTable];
++  self.watchedNonzero=-1;[watched addObject:self];gWatchedBuffers=watched;
++ }
++ if(!self.firstContents)self.firstContents=p;else if(p!=self.lastContents)self.contentsChanges++;
++ self.lastContents=p;
++}
++- (uint64_t)gpuAddress {self.gpuAddressCalls++;return nmb_buffer_gpu_address(_handle);}
+ - (MTLResourceOptions)resourceOptions {return _options;}
+ - (MTLStorageMode)storageMode {return (MTLStorageMode)((_options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
+ - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
+ - (MTLHazardTrackingMode)hazardTrackingMode {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);}
+-- (void)didModifyRange:(NSRange)range {(void)range;}
++- (void)didModifyRange:(NSRange)range {(void)range;self.modifyCalls++;}
+ - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
+  return notePurgeable(0,nmb_buffer_set_purgeable_state(_handle,state),state,[self allocatedSize],_purgeCounted,"buffer");
+ }
+@@ -2065,6 +2101,9 @@
+  if(manifest)fclose(manifest);
+ }
+ static NBTexture *rotationShadowOf(id t);   // rotatedSurfaceTexture's landscape stand-ins (below)
++// 2026-11-19 (Minecraft's vertex buffer reads all zero): the large buffers the app took a CPU pointer for, scanned every 50th commit;
++// a change in a buffer's nonzero words goes to stderr (the dump file) with the commit number.
++static void watchBuffersAtCommit(uint64_t commit);
+ @interface NBCommandBuffer : NBObject {
+ @public
+  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
+@@ -2099,6 +2138,7 @@
+ // NATIVE_METAL_DUMP_CB: the textures this command buffer wrote, met while it was encoded (dumpTargets), the render pass's attachments
+ // waiting for their encoder (dumpPending), how many passes and kernels it encoded so far, and whether it is the plugin's own readback.
+ @property(nonatomic,strong) NSMutableArray *dumpTargets,*dumpPending;
++@property(nonatomic,strong) NSMutableSet *dumpBuffers;   // the buffers its dumped draws bound, scanned again when it completed
+ @property(nonatomic) uint32_t dumpPasses,dumpKernels;
+ @property(nonatomic) BOOL dumpReadback;
+ @property(nonatomic,strong) NBTexture *wallpaperOutput;
+@@ -2519,6 +2559,19 @@
+    dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@ buffer %lu+%lu%@:%@",where,(unsigned long)buffer.length,(unsigned long)offset,
+                             buffer.label.length?[@" " stringByAppendingString:buffer.label]:@"",
+                             contents && offset<buffer.length?dumpWords(contents+offset,buffer.length-offset):@" not CPU-visible"]);
++   // 2026-11-19 (Minecraft's vertex data read all zero): how the buffer was made, and where in it the CPU sees any data at all.
++   if([(id)buffer isKindOfClass:[NBBuffer class]]) {
++    if(!_commandBuffer.dumpBuffers)_commandBuffer.dumpBuffers=[NSMutableSet set];
++    [_commandBuffer.dumpBuffers addObject:buffer];
++    NBBuffer *nb=(NBBuffer *)buffer;uint64_t nonzero=0,first=UINT64_MAX,last=0;const uint64_t words=buffer.length/4;
++    if(contents)for(uint64_t w=0;w<words;w++){uint32_t v;memcpy(&v,contents+w*4,4);if(v){nonzero++;if(first==UINT64_MAX)first=w*4;last=w*4;}}
++    dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@   made by %s, contents asked %u (first %p, last %p, changed %u), gpuAddress asked %u, didModifyRange %u",where,
++                             nb.madeBy?:"(other)",nb.contentsCalls,nb.firstContents,nb.lastContents,nb.contentsChanges,nb.gpuAddressCalls,nb.modifyCalls]);
++    dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@   made: options %#lx%@%@ contents %p | nonzero words %llu of %llu, first at %lld, last at %llu",where,
++                             (unsigned long)nb.options,nb.parentHeap?[NSString stringWithFormat:@" heap+%lu",(unsigned long)nb.heapOffset]:@"",
++                             nb.wrapped?@" no-copy":@"",contents,(unsigned long long)nonzero,(unsigned long long)words,
++                             first==UINT64_MAX?-1LL:(long long)first,(unsigned long long)last]);
++   }
+   } else dumpLine(_commandBuffer,[where stringByAppendingString:@" nil"]);
+  }
+ }
+@@ -2940,6 +2993,12 @@
+ }
+ - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n {
+  if(![self buffers:NB_OBJECTS(s,d) count:2])return;
++ if(dumpRange().first) {   // 2026-11-19: with dump-cb on, the first buffer-to-buffer copies (how an app uploads its vertex data)
++  static std::atomic<uint32_t> told{0};
++  if(told.fetch_add(1)<24)fprintf(stderr,"native-metal copy buffer: %lu bytes from %p (%lu bytes, options %#lx) +%lu to %p (%lu bytes, options %#lx) +%lu\n",
++                                   (unsigned long)n,(__bridge void *)s,(unsigned long)s.length,(unsigned long)[(NBBuffer *)s options],(unsigned long)so,(__bridge void *)d,
++                                   (unsigned long)d.length,(unsigned long)[(NBBuffer *)d options],(unsigned long)dO);
++ }
+  ENCODE([self check:nmb_blit_copy_buffer(self.handle,[(NBBuffer *)s handle],so,[(NBBuffer *)d handle],dO,n) what:"copyFromBuffer:toBuffer:"]);
+ }
+ - (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v {
+@@ -3296,6 +3355,20 @@
+  return (id<MTLTexture>)(id)shadow;
+ }
+ 
++static void watchBuffersAtCommit(uint64_t commit) {
++ NSArray *all=gWatchedBuffers.allObjects;
++ for(id o in all) {
++  NBBuffer *b=(NBBuffer *)o;const uint8_t *c=(const uint8_t *)nmb_buffer_contents(b.handle);if(!c)continue;
++  int64_t nz=0;const uint64_t words=nmb_buffer_length(b.handle)/4;
++  for(uint64_t w=0;w<words;w++){uint32_t v;memcpy(&v,c+w*4,4);if(v)nz++;}
++  if(nz!=b.watchedNonzero) {
++   fprintf(stderr,"native-metal watch: commit %llu buffer %p (%llu bytes, %s, contents asked %u) nonzero words %lld (was %lld)\n",
++           (unsigned long long)commit,(__bridge void *)b,(unsigned long long)nmb_buffer_length(b.handle),b.madeBy?:"?",b.contentsCalls,(long long)nz,
++           (long long)b.watchedNonzero);
++   b.watchedNonzero=nz;
++  }
++ }
++}
+ // Retain the surface's colour-space description and serialized-property hash with each sample.
+ @implementation NBCommandBuffer
+ // IOGPUMetalCommandBuffer's userDictionary: a mutable dictionary per command buffer, which MPS keeps its per-buffer state in (nil lost it).
+@@ -3316,6 +3389,27 @@
+ }
+ - (void)dealloc {DetailSpan timing(17,(uintptr_t)_handle);[self disown];nmb_command_buffer_release(_handle);}
+ - (void)own:(id)resource {
++ // 2026-11-19 (dump-cb on): the first distinct callers that use each buffer of 1 MiB and more, by symbol, two frames up (Minecraft's
++ // vertex and index buffers stay empty: which calls name them at all?).
++ static const bool traceUses=getenv("NATIVE_METAL_DUMP_CB")!=nullptr;
++ if(traceUses && [resource isKindOfClass:[NBBuffer class]] && nmb_buffer_length([(NBBuffer *)resource handle])>=(1u<<20)) {
++  void *r0=__builtin_return_address(0),*r1=__builtin_extract_return_addr(__builtin_frame_address(1)?__builtin_return_address(1):nullptr);
++  Dl_info a={},b={};dladdr(r0,&a);if(r1)dladdr(r1,&b);
++  // Image offsets (symbolicated with the build's dSYM): local Objective-C methods have no exported name for dladdr.
++  NSString *key=[NSString stringWithFormat:@"%s+%#lx <- %s+%#lx",a.dli_fname?strrchr(a.dli_fname,'/')+1:"?",(unsigned long)((uintptr_t)r0-(uintptr_t)a.dli_fbase),
++                 b.dli_fname?strrchr(b.dli_fname,'/')+1:"?",(unsigned long)(r1?(uintptr_t)r1-(uintptr_t)b.dli_fbase:0)];
++  static char tracedKey;
++  NSMutableSet *seen=objc_getAssociatedObject(resource,&tracedKey);
++  if(!seen){seen=[NSMutableSet set];objc_setAssociatedObject(resource,&tracedKey,seen,OBJC_ASSOCIATION_RETAIN);}
++  @synchronized(seen) {
++   if(seen.count<8 && ![seen containsObject:key]) {
++    [seen addObject:key];
++    fprintf(stderr,"native-metal use: buffer %p (%llu bytes, %s, contents asked %u) by %s\n",(__bridge void *)resource,
++            (unsigned long long)nmb_buffer_length([(NBBuffer *)resource handle]),[(NBBuffer *)resource madeBy]?:"?",
++            [(NBBuffer *)resource contentsCalls],key.UTF8String);
++   }
++  }
++ }
+  const NSUInteger before=_resourceOwners.count;
+  [_resourceOwners addObject:resource];
+  if(_resourceOwners.count!=before && [(NBObject *)resource purgeHold:YES])noteLateUse();
+@@ -3409,6 +3503,15 @@
+  NmbCommandBuffer *handle=_handle;
+  return [self encoder:[NBBlitEncoder new] make:^{return nmb_blit_encoder_new(handle);} what:@"blitCommandEncoder"];
+ }
++// 2026-11-19: the pass-descriptor forms (Metal 2.x+). Minecraft (Renderdragon) makes its upload encoders with
++// blitCommandEncoderWithDescriptor:; unanswered, it got nil and every copyFromBuffer:toBuffer: into its vertex and index buffers was a
++// message to nil: they stayed zero and every frame was black. The descriptors' sample buffer attachments (GPU counters) are not kept.
++- (id<MTLBlitCommandEncoder>)blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor *)d {
++ (void)d;return [(id<MTLCommandBuffer>)self blitCommandEncoder];
++}
++- (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)d {
++ return [(id<MTLCommandBuffer>)self computeCommandEncoderWithDispatchType:d?d.dispatchType:MTLDispatchTypeSerial];
++}
+ - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
+  NmbRenderPassDescriptor pass={};
+  std::vector<SingleSampleCopy> resolveCopies;
+@@ -3650,6 +3753,22 @@
+ }
+ - (void)commit {
+  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
++ if(gWatchedBuffers){static std::atomic<uint64_t> commits{0};const uint64_t n=++commits;if(n%50==0)watchBuffersAtCommit(n);}
++ if(_dumpBuffers.count) {   // 2026-11-19: are the bound buffers' bytes there by commit time, and by completion (written after encoding)?
++  for(NBBuffer *b in _dumpBuffers) {
++   const uint8_t *c=(const uint8_t *)nmb_buffer_contents(b.handle);uint64_t nz=0;
++   if(c)for(uint64_t w=0;w<b.length/4;w++){uint32_t v;memcpy(&v,c+w*4,4);if(v)nz++;}
++   fprintf(stderr,"native-metal dump buffer %p (%lu bytes) at commit: nonzero words %llu\n",(__bridge void *)b,(unsigned long)b.length,(unsigned long long)nz);
++  }
++  NSSet *buffers=[_dumpBuffers copy];
++  [self addCompletedHandler:^(id<MTLCommandBuffer>) {
++   for(NBBuffer *b in buffers) {
++    const uint8_t *c=(const uint8_t *)nmb_buffer_contents(b.handle);uint64_t nz=0;
++    if(c)for(uint64_t w=0;w<b.length/4;w++){uint32_t v;memcpy(&v,c+w*4,4);if(v)nz++;}
++     fprintf(stderr,"native-metal dump buffer %p (%lu bytes) at completion: nonzero words %llu\n",(__bridge void *)b,(unsigned long)b.length,(unsigned long long)nz);
++   }
++  }];
++ }
+  if(_rotatedShadows.count && !self.encodeFailure){   // what CA drew in landscape, into the portrait surface (rotatedSurfaceTexture)
+   NSArray *shadows=[_rotatedShadows allObjects];[_rotatedShadows removeAllObjects];
+   for(NBTexture *shadow in shadows){
+@@ -4395,7 +4514,7 @@
+ - (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {
+  NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options&kNBDefinedResourceOptions,offset);
+  if(!handle){NBLOG(@"native-metal: heap buffer refused: %@",lastError());return nil;}
+- NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;
++ NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.parentHeap=(id<MTLHeap>)self;buffer.madeBy="heap newBufferWithLength";
+  buffer.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {return [self bufferWithLength:length options:options offset:UINT64_MAX];}
+@@ -4676,13 +4795,13 @@
+ - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options&kNBDefinedResourceOptions,nullptr);
+  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
+- NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
++ NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.madeBy="newBufferWithLength";return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
+  if(!bytes)return nil;
+  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options&kNBDefinedResourceOptions,bytes);
+  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
+- NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
++ NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.madeBy="newBufferWithBytes";return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
+  void *context=deallocator?(__bridge_retained void *)[deallocator copy]:nullptr;
+@@ -4692,7 +4811,7 @@
+   NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;
+  }
+  gNoCopyAll++;if(context)gNoCopyMade++;
+- NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
++ NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;buffer.madeBy="newBufferWithBytesNoCopy";
+  return (id<MTLBuffer>)buffer;
+ }
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {

@@ -1,0 +1,204 @@
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -475,9 +475,18 @@
+  * Indicates whether we allow EL0 to read the virtual timebase (CNTVCT_EL0)
+  * as a continuous time source (e.g. from mach_continuous_time)
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern int sweet_tb24;
++#endif
++
+ boolean_t
+ user_cont_hwclock_allowed(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_tb24) {
++		return FALSE;   /* EL0 cannot scale the counter (see sweet_tb24 below) */
++	}
++#endif
+ #if HAS_CONTINUOUS_HWCLOCK
+ 	return TRUE;
+ #else
+@@ -496,9 +505,25 @@
+  *
+  */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* sweet: 1 = the mach timebase is the 19.2 MHz counter scaled to 24 MHz (pexpert/arm/pe_identify_machine.c) */
++int sweet_tb24 = 0;
++
++static inline uint64_t
++sweet_tb_up(uint64_t hw)
++{
++	return sweet_tb24 ? hw + (hw >> 2) : hw;       /* floor(hw * 5 / 4): monotonic */
++}
++#endif
++
+ uint8_t
+ user_timebase_type(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_tb24) {
++		return USER_TIMEBASE_NONE;      /* EL0 cannot scale the counter: mach_absolute_time takes the trap */
++	}
++#endif
+ #if HAS_ACNTVCT
+ 	return USER_TIMEBASE_NOSPEC_APPLE;
+ #elif HAS_APPLE_GENERIC_TIMER
+@@ -2490,6 +2515,12 @@
+ 
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+ 	cdp->cpu_decrementer = dec_value;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_tb24) {
++		/* 24 MHz ticks -> 19.2 MHz counter ticks, rounded up so the pop is never early */
++		dec_value = (uint32_t)(((uint64_t)dec_value * 4 + 4) / 5);
++	}
++#endif
+ 
+ 	if (cdp->cpu_set_decrementer_func) {
+ 		cdp->cpu_set_decrementer_func(dec_value);
+@@ -2505,7 +2536,11 @@
+ static inline uint64_t
+ speculative_timebase(void)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	return sweet_tb_up(__builtin_arm_rsr64(KERNEL_CNTVCT_EL0));
++#else
+ 	return __builtin_arm_rsr64(KERNEL_CNTVCT_EL0);
++#endif
+ }
+ 
+ /**
+@@ -2517,7 +2552,11 @@
+ nonspeculative_timebase(void)
+ {
+ #if   __ARM_ARCH_8_6__
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	return sweet_tb_up(__builtin_arm_rsr64(KERNEL_CNTVCTSS_EL0));
++#else
+ 	return __builtin_arm_rsr64(KERNEL_CNTVCTSS_EL0);
++#endif
+ #else
+ 	// ISB required by ARMV7C.b section B8.1.2 & ARMv8 section D6.1.2
+ 	// "Reads of CNT[PV]CT[_EL0] can occur speculatively and out of order relative
+@@ -2633,6 +2672,12 @@
+ 		dec = (uint32_t)wide_val;
+ 		assert(wide_val == (uint64_t)dec);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_tb24) {
++		/* counter ticks (TVAL counts down through zero: signed) -> 24 MHz ticks */
++		dec = (uint32_t)(int32_t)(((int64_t)(int32_t)dec * 5) / 4);
++	}
++#endif
+ 
+ 	return dec;
+ }
+--- a/pexpert/arm/pe_identify_machine.c
++++ b/pexpert/arm/pe_identify_machine.c
+@@ -146,6 +146,28 @@
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * sweet 2026-11-17: a 24 MHz mach timebase on a 19.2 MHz counter. iOS 27 user space hard-codes Apple's
++	 * 24 MHz timebase in places (CoreAudio AudioConvertHostTimeToNanos = x * 125 / 3, AudioGetHostClockFrequency
++	 * = 24e6; ~90 such sites in the audio libraries alone) instead of asking mach_timebase_info. On the SM8150's
++	 * 19.2 MHz generic timer the HAL then runs its I/O cycles 25 % slow (1024 frames = 512000 ticks = 26.7 ms) and
++	 * resyncs every 65536 frames: audio cut-outs. So the kernel presents 24 MHz: every timebase read is scaled by
++	 * 5/4 (osfmk/arm64/machine_routines.c), timer programming by 4/5, EL0 reads go through the mach trap
++	 * (USER_TIMEBASE_NONE) or are emulated (sleh.c). Boot-arg sweettb24=0 keeps the hardware rate.
++	 */
++	{
++		extern int sweet_tb24;
++		uint32_t on = 1;
++		PE_parse_boot_argn("sweettb24", &on, sizeof(on));
++		if (on && gPEClockFrequencyInfo.timebase_frequency_hz == 19200000) {
++			gPEClockFrequencyInfo.timebase_frequency_hz = 24000000;
++			gPEClockFrequencyInfo.dec_clock_rate_hz = 24000000;
++			sweet_tb24 = 1;
++		}
++	}
++#endif
++
+ 	/* Set the num / den pairs form the hz values. */
+ 	gPEClockFrequencyInfo.bus_clock_rate_num = gPEClockFrequencyInfo.bus_clock_rate_hz;
+ 	gPEClockFrequencyInfo.bus_clock_rate_den = 1;
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3157,7 +3157,59 @@
+ }
+ 
+ 
+-__attribute__((noreturn))
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <pexpert/pexpert.h>
++extern int sweet_tb24;  /* osfmk/arm64/machine_routines.c */
++static unsigned sweet_tb24_logged;
++
++/*
++ * sweet 2026-11-17: with the 24 MHz timebase (pexpert/arm/pe_identify_machine.c) EL0 has no access to the generic
++ * timer (USER_TIMEBASE_NONE clears CNTKCTL_EL1.EL0VCTEN/EL0PCTEN), so a direct MRS of the counter or its frequency
++ * traps here. Answer it in the kernel's 24 MHz units: CNTVCT/CNTPCT(SS) = mach_absolute_time(), CNTFRQ = 24 MHz.
++ * ISS for EC 0x18: Op0 [21:20], Op2 [19:17], Op1 [16:14], CRn [13:10], Rt [9:5], CRm [4:1], read [0].
++ */
++static bool
++sweet_tb24_mrs(arm_saved_state_t *state, uint64_t esr)
++{
++	uint32_t iss = (uint32_t)ESR_ISS(esr);
++	unsigned op0 = (iss >> 20) & 3, op2 = (iss >> 17) & 7, op1 = (iss >> 14) & 7, crn = (iss >> 10) & 15;
++	unsigned rt = (iss >> 5) & 31, crm = (iss >> 1) & 15;
++	uint64_t v;
++	const char *what;
++
++	if (!sweet_tb24 || !(iss & 1) || op0 != 3 || op1 != 3 || crn != 14 || crm != 0) {
++		return false;
++	}
++	switch (op2) {
++	case 0:
++		v = gPEClockFrequencyInfo.timebase_frequency_hz;
++		what = "CNTFRQ_EL0";
++		break;
++	case 1:
++	case 2:
++	case 5:
++	case 6:
++		v = mach_absolute_time();
++		what = op2 == 1 ? "CNTPCT_EL0" : op2 == 2 ? "CNTVCT_EL0" : op2 == 5 ? "CNTPCTSS_EL0" : "CNTVCTSS_EL0";
++		break;
++	default:
++		return false;
++	}
++	if (rt != 31) {
++		saved_state64(state)->x[rt] = v;
++	}
++	add_saved_state_pc(state, 4);
++	if (sweet_tb24_logged < 16) {
++		sweet_tb24_logged++;
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		printf("SWEET TB24: EL0 read of %s in %s pc 0x%llx (emulated, 24 MHz)\n", what, name,
++		    (uint64_t)get_saved_state_pc(state) - 4);
++	}
++	return true;
++}
++#endif
++
+ static void
+ handle_msr_trap(arm_saved_state_t *state, uint64_t esr)
+ {
+@@ -3174,6 +3226,12 @@
+ 		panic("MSR/MRS trap (ESR 0x%llx) from kernel", esr);
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_tb24_mrs(state, esr)) {
++		return;
++	}
++#endif
++
+ 	COPYIN(get_saved_state_pc(state), (char *)&instr, sizeof(instr));
+ 	codes[1] = instr;
+ 

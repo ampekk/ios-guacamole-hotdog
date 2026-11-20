@@ -1,0 +1,34 @@
+--- a/libkern/c++/OSKext.cpp
++++ b/libkern/c++/OSKext.cpp
+@@ -15715,7 +15715,12 @@
+ 		IOLockLock(sKextSummariesLock);
+ 	}
+ 
+-	for (uint32_t i = 0; i < gLoadedKextSummaries->numSummaries; ++i) {
++	/*
++	 * SWEET: no kexts are ever loaded, so gLoadedKextSummaries stays NULL. Kernel telemetry
++	 * (telemetry_backtrace_add_kexts from drain_record_submission_buffer_thread_call) walked it anyway:
++	 * "Kernel data abort" at foreachKextInBacktrace+0x44, far 0 (2026-11-14, iOS 27.2 once on Wi-Fi).
++	 */
++	for (uint32_t i = 0; gLoadedKextSummaries != NULL && i < gLoadedKextSummaries->numSummaries; ++i) {
+ 		OSKextLoadedKextSummary * summary;
+ 
+ 		summary = gLoadedKextSummaries->summaries + i;
+@@ -15771,7 +15776,7 @@
+ #if  __has_feature(ptrauth_calls)
+ 	addr = (uintptr_t)VM_KERNEL_STRIP_PTR(addr);
+ #endif /*  __has_feature(ptrauth_calls) */
+-	for (unsigned i = 0; i < gLoadedKextSummaries->numSummaries; ++i) {
++	for (unsigned i = 0; gLoadedKextSummaries != NULL && i < gLoadedKextSummaries->numSummaries; ++i) {   /* SWEET: may be NULL */
+ 		OSKextLoadedKextSummary *summary = &gLoadedKextSummaries->summaries[i];
+ 		if (!summary->address) {
+ 			continue;
+@@ -15902,7 +15907,7 @@
+ findSummary(uint32_t tagID)
+ {
+ 	OSKextLoadedKextSummary * summary;
+-	for (size_t i = 0; i < gLoadedKextSummaries->numSummaries; ++i) {
++	for (size_t i = 0; gLoadedKextSummaries != NULL && i < gLoadedKextSummaries->numSummaries; ++i) {   /* SWEET: may be NULL */
+ 		summary = gLoadedKextSummaries->summaries + i;
+ 		if (summary->loadTag == tagID) {
+ 			return summary;

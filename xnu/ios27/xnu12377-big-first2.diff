@@ -1,0 +1,60 @@
+--- ../../research/ios27.2/kernel-backup/processor.c.before-bigfirst2	2026-11-17 02:39:16.009106432 +0000
++++ osfmk/kern/processor.c	2026-11-17 02:39:16.024930682 +0000
+@@ -2032,3 +2032,31 @@
+ }
+ 
+ #endif /* defined(__arm64__) */
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * 2026-11-17 big cores first, take 2 (bsd/dev/sweet_cpufreq.c sweet_big_first). sched_perfcontrol_edge_cpu_rotation_
++ * bitmasks_set() is an empty stub here: CONFIG_SCHED_EDGE needs __AMP__, and SWEET is one SMP cluster (Clutch only).
++ * But choose_processor() reads the pset's perfcontrol_cpu_preferred_bitmask / _migration_bitmask in either build,
++ * so they are set directly: preferred = idle CPUs taken first, migration = idle CPUs avoided while a non-avoided one is
++ * idle. Returns what was set (masked with the pset's CPUs).
++ */
++void sweet_sched_cpu_masks(uint64_t preferred, uint64_t migrate, uint64_t *set_preferred, uint64_t *set_migrate);
++void
++sweet_sched_cpu_masks(uint64_t preferred, uint64_t migrate, uint64_t *set_preferred, uint64_t *set_migrate)
++{
++	processor_set_t pset = pset_array[0];
++	*set_preferred = *set_migrate = 0;
++	if (pset == PROCESSOR_SET_NULL) {
++		return;
++	}
++	spl_t s = splsched();
++	pset_lock(pset);
++	pset->perfcontrol_cpu_preferred_bitmask = preferred & pset->cpu_bitmask;
++	pset->perfcontrol_cpu_migration_bitmask = migrate & pset->cpu_bitmask & ~pset->perfcontrol_cpu_preferred_bitmask;
++	*set_preferred = pset->perfcontrol_cpu_preferred_bitmask;
++	*set_migrate = pset->perfcontrol_cpu_migration_bitmask;
++	pset_unlock(pset);
++	splx(s);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- ../../research/ios27.2/kernel-backup/sweet_cpufreq.c.before-bigfirst2	2026-11-17 02:39:16.011391348 +0000
++++ bsd/dev/sweet_cpufreq.c	2026-11-17 02:39:16.026719015 +0000
+@@ -19,8 +19,7 @@
+ #include <machine/machine_routines.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-extern void sched_perfcontrol_edge_cpu_rotation_bitmasks_set(uint32_t pset_id, uint64_t preferred_bitmask,
+-    uint64_t migration_bitmask);
++extern void sweet_sched_cpu_masks(uint64_t preferred, uint64_t migrate, uint64_t *set_preferred, uint64_t *set_migrate);
+ extern unsigned int ml_get_cpu_count(void);
+ void sweet_cpufreq_init(void);
+ 
+@@ -47,8 +46,11 @@
+ 		printf("SWEET CPUFREQ: big cores first: off (sweetbigfirst=%u, %u cpus)\n", on, n);
+ 		return;
+ 	}
+-	sched_perfcontrol_edge_cpu_rotation_bitmasks_set(0, big, little);
+-	printf("SWEET CPUFREQ: big cores first: preferred %#llx, migrate off %#llx (%u cpus)\n", big, little, n);
++	/* take 2: the Edge call above is an empty stub without __AMP__ (ptop 11-17: still everything on cpu 0-3) */
++	uint64_t got_big = 0, got_little = 0;
++	sweet_sched_cpu_masks(big, little, &got_big, &got_little);
++	printf("SWEET CPUFREQ: big cores first: preferred %#llx, migrate off %#llx (asked %#llx %#llx, %u cpus)\n", got_big,
++	    got_little, big, little, n);
+ }
+ 
+ #define OSM_SIZE                0x1400u

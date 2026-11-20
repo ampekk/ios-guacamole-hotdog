@@ -1,0 +1,85 @@
+--- a/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
++++ b/UniXNU/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+@@ -2468,7 +2468,15 @@
+ }
+ @implementation NBEncoder {
+  std::unique_ptr<DrawStateNote> _drawNote;
++ // 2026-11-19: what each of the first 32 slots of stages 0-3 (compute, vertex, fragment, tile) holds, to skip a bind that changes
++ // nothing (Minecraft binds the same textures, samplers and buffers again for every draw: each bind was a type check, a resource
++ // hold, a closure and a bridge call on its render thread). A bit in *Known says the slot's entry is what the runtime holds. The
++ // objects are held by the command buffer (own:) while this encoder lives, so an address cannot come back as another object.
++ const void *_slotBuffer[4][32];NSUInteger _slotOffset[4][32];uint32_t _bufferKnown[4];
++ const void *_slotTexture[4][32];uint32_t _textureKnown[4];
++ const void *_slotSampler[4][32];uint32_t _samplerKnown[4];
+ }
++static std::atomic<uint64_t> gBindsSkipped{0},gBindsMade{0};
+ - (void)dealloc {DetailSpan timing(16,(uintptr_t)_handle);if(_handle)nmb_encoder_discard(_handle);}
+ // A setter of `kind` at `key` (UINT32_MAX: one not compared) binding `object` with `value`, for the draw-stats tally.
+ - (void)noteState:(uint32_t)kind key:(uint32_t)key object:(const void *)object value:(uint64_t)value {
+@@ -2577,6 +2585,12 @@
+ }
+ // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
+ - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
++ if(stage<4 && index<32) {
++  const uint32_t bit=1u<<index;
++  if((_bufferKnown[stage]&bit) && _slotBuffer[stage][index]==(__bridge const void *)buffer && _slotOffset[stage][index]==offset){gBindsSkipped++;return;}
++  _slotBuffer[stage][index]=(__bridge const void *)buffer;_slotOffset[stage][index]=offset;_bufferKnown[stage]|=bit;
++ }
++ gBindsMade++;
+  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
+  if(buffer)[_commandBuffer own:buffer];
+  if(gDrawStats)[self noteState:kDSBuffer key:stage<<8|(uint32_t)index object:(__bridge const void *)buffer value:offset];
+@@ -2584,6 +2598,12 @@
+  ENCODE([self check:nmb_encoder_set_buffer(self->_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"]);
+ }
+ - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
++ if(stage<4 && index<32) {
++  const uint32_t bit=1u<<index;
++  if((_textureKnown[stage]&bit) && _slotTexture[stage][index]==(__bridge const void *)texture){gBindsSkipped++;return;}
++  _slotTexture[stage][index]=(__bridge const void *)texture;_textureKnown[stage]|=bit;
++ }
++ gBindsMade++;
+  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
+  if(gDrawStats)[self noteState:kDSTexture key:stage<<8|(uint32_t)index object:(__bridge const void *)texture value:0];
+  if(texture && stage==0 && (texture.usage&MTLTextureUsageShaderWrite) && dumpMaybe(_commandBuffer)) {
+@@ -2602,6 +2622,12 @@
+  ENCODE([self check:nmb_encoder_set_texture(self->_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"]);
+ }
+ - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
++ if(stage<4 && index<32) {
++  const uint32_t bit=1u<<index;
++  if((_samplerKnown[stage]&bit) && _slotSampler[stage][index]==(__bridge const void *)sampler){gBindsSkipped++;return;}
++  _slotSampler[stage][index]=(__bridge const void *)sampler;_samplerKnown[stage]|=bit;
++ }
++ gBindsMade++;
+  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+  [self dumpBind:sampler index:index stage:stage+8];
+  if(gDrawStats)[self noteState:kDSSampler key:stage<<8|(uint32_t)index object:(__bridge const void *)sampler value:0];
+@@ -2614,6 +2640,7 @@
+  [self sampler:(id<MTLSamplerState>)clamped index:index stage:stage];
+ }
+ - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
++ if(stage<4 && index<32)_bufferKnown[stage]&=~(1u<<index);   // the slot holds bytes now, not a buffer
+  if(dumpMaybe(_commandBuffer))[self dumpBind:[NSData dataWithBytes:bytes length:length] index:index stage:stage];
+  if(gDrawStats)[self noteState:kDSBytes key:stage<<8|(uint32_t)index object:nullptr value:hashBytes(bytes,length)];
+  if(!gEncodeThread){[self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];return;}
+@@ -2629,6 +2656,10 @@
+ - (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
+ - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
+ - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
++ if(stage<4 && index<32 && (_bufferKnown[stage]&(1u<<index))) {
++  if(_slotOffset[stage][index]==offset){gBindsSkipped++;return;}
++  _slotOffset[stage][index]=offset;
++ }
+  id bound=_dumpBound[@(stage<<8|(uint32_t)index)];
+  if(gDrawStats)[self noteState:kDSOffset key:stage<<8|(uint32_t)index object:nullptr value:offset];
+  if([bound isKindOfClass:[NSArray class]])[self dumpBind:@[bound[0],@(offset)] index:index stage:stage];
+@@ -3356,6 +3387,8 @@
+ }
+ 
+ static void watchBuffersAtCommit(uint64_t commit) {
++ if(commit%500==0)fprintf(stderr,"native-metal binds: commit %llu made %llu skipped %llu (unchanged slots)\n",(unsigned long long)commit,
++                          (unsigned long long)gBindsMade.load(),(unsigned long long)gBindsSkipped.load());
+  NSArray *all=gWatchedBuffers.allObjects;
+  for(id o in all) {
+   NBBuffer *b=(NBBuffer *)o;const uint8_t *c=(const uint8_t *)nmb_buffer_contents(b.handle);if(!c)continue;

@@ -1,0 +1,78 @@
+--- research/ios27.2/kernel-backup/flame_sta.c.before-quietlink	2026-11-15 08:27:11.124526477 +0000
++++ work/xnu-12377/bsd/dev/flame_sta.c	2026-11-16 03:35:48.076394953 +0000
+@@ -40,6 +40,13 @@
+ 
+ static struct redwood_sta_bss sta_joined_bss;
+ static int sta_last_error;
++/*
++ * 2026-11-15: wland drops the old link before it joins a new network (and when asked to leave): that link down is
++ * no loss. Reported as one (involuntary, reason 4) it reached wifid in the middle of its join, which then failed the
++ * join (-3902) although the new link came up 0.1 s later, so the network was never saved and auto-join at boot had
++ * nothing to join. True while a join, a leave or a power-off of ours runs.
++ */
++static volatile bool sta_quiet;
+ 
+ static const uint16_t sta_freqs[] = {
+ 	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
+@@ -49,9 +56,15 @@
+ };
+ 
+ static int
+-sta_power(__unused bool on)
++sta_power(bool on)
+ {
+-	return 0;                               /* the radio stays up with the modem */
++	/* the radio stays up with the modem; Wi-Fi off in Settings leaves the network (2026-11-15: it stayed joined) */
++	if (!on && flame_wlan_joined()) {
++		sta_quiet = true;
++		(void)flame_wlan_leave();
++		sta_quiet = false;
++	}
++	return 0;
+ }
+ 
+ static int
+@@ -95,6 +108,7 @@
+ 	for (int i = 0; i < 6; i++) {
+ 		any |= what->bssid[i] != 0;
+ 	}
++	sta_quiet = true;
+ 	if (what->security == REDWOOD_STA_WPA2_PSK && what->passphrase_length == 0) {
+ 		error = flame_wlan_join_pmk(what->ssid, what->ssid_length, any ? what->bssid : NULL, what->pmk);
+ 	} else error = flame_wlan_join(what->ssid, what->ssid_length, any ? what->bssid : NULL,
+@@ -118,6 +132,7 @@
+ 			}
+ 		}
+ 	}
++	sta_quiet = false;
+ 	printf("flame wifi: join -> %d\n", error);
+ 	return error;
+ }
+@@ -125,7 +140,10 @@
+ static int
+ sta_leave(void)
+ {
+-	return flame_wlan_leave();
++	sta_quiet = true;
++	int error = flame_wlan_leave();
++	sta_quiet = false;
++	return error;
+ }
+ 
+ static void
+@@ -194,6 +212,15 @@
+ static void
+ sta_link_changed(bool up)
+ {
++	/*
++	 * wland drops the old association as part of an explicit join/leave. Do not publish that transient DOWN to
++	 * configd/wifid either: suppressing only redwood_sta_lost() still emits KEV_DL_LINK_OFF through en0 and
++	 * makes iOS abort/save the join as failed. The matching UP (or JOIN_DONE) reports the completed operation.
++	 */
++	if (!up && sta_quiet) {
++		printf("flame wifi: suppressed requested link-down during join/leave\n");
++		return;
++	}
+ 	redwood_net_link_state(up);
+ 	if (!up && sta_last_error == 0) {
+ 		redwood_sta_lost(ECONNRESET);

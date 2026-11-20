@@ -1,0 +1,16 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2399,7 +2399,12 @@
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		if (args->structureInputSize == 0x588) {
++		/*
++		 * iOS 27.2 (24B119 IOMobileFramebuffer: SwapBegin zeroes 0x6e0 bytes at fb+0x18, id at fb+0xb0;
++		 * kern_SwapSetLayer: surface ids fb+0xb4, rects fb+0xc4/+0x124, set/clear masks fb+0x164/+0x168,
++		 * flags fb+0x174) = the iOS 26 offsets in a longer record: fold it the same way.
++		 */
++		if (args->structureInputSize == 0x588 || args->structureInputSize == 0x6e0) {
+ 			/*
+ 			 * iOS 26 (23F84 IOMobileFramebuffer: SwapEnd = IOConnectCallStructMethod(5, swap + 0x18, 0x588)):
+ 			 * 0x48 more bytes before the swap id; from the id on the fields iOS 16 used keep their order (read

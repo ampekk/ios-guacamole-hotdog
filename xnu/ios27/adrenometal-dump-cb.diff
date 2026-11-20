@@ -1,0 +1,38 @@
+--- research/ios27.2/NativeAdrenoMetalPlugin.mm.before-dumpcb	2026-11-18 11:13:25.477810138 +0000
++++ work/UniXNU/drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm	2026-11-18 11:12:57.739346568 +0000
+@@ -342,6 +342,35 @@
+                     setenv("MESA_LOG_FILE", log, 0);
+                 }
+         }
++        // dump-cb=NAME:FIRST[:COUNT] (2026-11-18): NATIVE_METAL_DUMP_CB=FIRST:COUNT in the processes whose name starts with NAME, with their
++        // standard error (where the dump goes) appended to /private/var/tmp/NativeAdrenoMetal.trace/dump-NAME-PID.log: an app's stderr
++        // goes nowhere. Each dumped command buffer's passes, draws and attachments as brightness grids: does the app draw black itself?
++        {
++            char args[1100] = {};
++            size_t size = sizeof args - 1;
++            if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
++                if (const char *at = bootArgToken(args, "dump-cb=")) {
++                    char value[96] = {};
++                    strlcpy(value, at + strlen("dump-cb="), sizeof value);
++                    value[strcspn(value, " ")] = 0;
++                    char *range = strchr(value, ':');
++                    const char *name = getprogname();
++                    if (range && range > value && name && !strncmp(name, value, (size_t)(range - value))) {
++                        *range++ = 0;
++                        setenv("NATIVE_METAL_DUMP_CB", range, 1);
++                        char log[160];
++                        mkdir("/private/var/tmp/NativeAdrenoMetal.trace", 0755);
++                        snprintf(log, sizeof log, "/private/var/tmp/NativeAdrenoMetal.trace/dump-%s-%d.log", name, (int)getpid());
++                        // A sandboxed app may not write there: its own tmp directory then.
++                        if (!freopen(log, "a", stderr)) {
++                            snprintf(log, sizeof log, "%sdump-%s-%d.log", NSTemporaryDirectory().fileSystemRepresentation, name, (int)getpid());
++                            if (!freopen(log, "a", stderr)) strlcpy(log, "(no file)", sizeof log);
++                        }
++                        setvbuf(stderr, nullptr, _IOLBF, 0);
++                        os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: dump-cb %{public}s into %{public}s", range, log);
++                    }
++                }
++        }
+         // Turnip chooses each pass's rendering: tile memory (GMEM) or system memory, by its own rules (a pass with a memoryless
+         // attachment or a feedback loop in tile memory, a pass of few draws in system memory, the others by the bandwidth each would
+         // take). A pass in system memory has no tile load and store, which is what a screen-size pass that

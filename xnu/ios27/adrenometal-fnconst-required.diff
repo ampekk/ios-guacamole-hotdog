@@ -1,0 +1,21 @@
+--- a/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
++++ b/drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm
+@@ -1584,13 +1584,17 @@
+ @property(nonatomic,strong) NSData *bitCodeHashData;
+ @property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // specialized with (nil: none), for the zero-rest rebuild of a refused pipeline
+ @end
++// 2026-11-17: MTLFunctionConstant's getter is -required (Apple: @property (readonly) BOOL required). With getter=isRequired
++// only -isRequired existed, and cameracaptured's Portrait prewarm (CCPortrait under SDOFRenderingV5, from
++// FigCapturePreloadShaders) died on "-[NBFunctionConstant required]: unrecognized selector" at every start. Both now.
+ @interface NBFunctionConstant : NSObject
+ @property(nonatomic,copy) NSString *name;
+ @property(nonatomic) MTLDataType type;
+ @property(nonatomic) NSUInteger index;
+-@property(nonatomic,getter=isRequired) BOOL required;
++@property(nonatomic) BOOL required;
+ @end
+ @implementation NBFunctionConstant
++- (BOOL)isRequired {return _required;}
+ @end
+ @implementation NBFunction
+ - (NSDictionary<NSString *,MTLFunctionConstant *> *)functionConstantsDictionary {
