@@ -1,0 +1,43 @@
+name: xnu12377
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deps
+        run: brew install jq gum bash cmake ninja
+      - name: Prepare source tree
+        run: |
+          git init dxb
+          git -C dxb fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build 663906528d1cd5ea8fde7de6f16de73db9511549
+          git -C dxb checkout -q FETCH_HEAD
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          for f in xnu/ios27/*.diff xnu/ios27/*.patch; do
+            [ -f "$f" ] || continue
+            cp "$f" "dxb/patches/9000-$(basename "$f" | sed 's/\.\(diff\|patch\)$/.patch/')"
+          done
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          echo "patches: $(ls dxb/patches | wc -l)"
+      - name: Build
+        working-directory: dxb
+        env:
+          MACOS_VERSION: "26.5"
+          KERNEL_CONFIG: DEVELOPMENT
+          MACHINE_CONFIG: SWEET
+        run: bash build.sh 2>&1 | tee ../build.log
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          cp build.log out/ 2>/dev/null || true
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu12377-kernel
+          path: out/
+          retention-days: 30
