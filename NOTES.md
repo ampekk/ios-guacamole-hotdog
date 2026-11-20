@@ -1,3 +1,46 @@
+# Handoff — images assembled from device/Apple sources; kernel forward-port is the blocker (2026-11-20, OpenCode)
+- Device is back on Android with working Magisk root (`adb shell su -c id` -> uid=0 context=u:r:magisk:s0),
+  per the user. Earlier shim boot tests remain valid evidence (see the section below).
+- Pulled from this hotdog, kept OUT of git under `/home/ampekk/backups/hotdog-fw/`:
+  `gpu/{a640_gmu.bin 37680, a630_sqe.fw 32304, a640_zap.mdt 6860, a640_zap.b00 148, .b01 6712, .b02 1968}`
+  and `haptic/aw8697_haptic_168.bin 5961`. Copied into the gitignored `research/gpu/fw/` and
+  `dtb/haptics/` so `mkadt.py` embeds real phone firmware. `mkadt.py --dump` confirms `/sweet-gpu`
+  `gmu-firmware` (37680 bytes) and `/sweet-haptic`.
+- Obtained Apple's D73AP device tree without a Mac: fetched `DeviceTree.d73ap.im4p` (50817 B, CRC-32 ok)
+  from the iOS 27.2 24B119 IPSW with `tools/remotezip.py` (range requests), parsed the ASN.1 IM4P
+  (payload at offset 52, `bvx2` LZFSE), decoded with Python `lzfse` -> `research/ios26/d73ap.adt`
+  (254788 B, parses: chosen/options/cpus/.../backlight). This file is a gitignored Apple artifact.
+- Generated the full final ADT: `python3 tools/mkadt.py /tmp/hotdog-final.adt --highmem --hotdog
+  --identity d73 --scale2 --ram5g` -> 109140 B, SHA-256
+  `c17341e4c655e06abae36d9e0ee28f4f19e3514125771d3b7bf5abccc68d4251`. Dump confirms D73AP/iPhone15,2,
+  `hotdog,wcn3990`, canvas 828x1792, sweet-fbcon 1440x3120, GPU/haptic nodes.
+- `tools/guac-mkboot.sh` now accepts `ADT_EXTRA="--identity d73 --scale2 --ram5g"` so the final image
+  can be assembled once a kernel exists.
+- CI (all on `ampekk/ios-guacamole-hotdog`, logged with exact run IDs):
+  - 44702140456 `probe`: macOS 26.7.2, Xcode 26.6, Darwin xnu-12377.161.15 -> a real xnu-12377
+    build runner IS available.
+  - 44702448624: first xnu12377 attempt put our patches in `dxb/patches/` but the macOS 26 path is
+    `dxb/patches/26.0/`; failed `Unsupported CURRENT_MACHINE_CONFIG SWEET`.
+  - 44703356871: patches in the right dir, but `zz1-0019-stage-libpthread.sh` aborts with
+    "SWEET libpthread integration requires xnu-8796.141.3 (macOS 13.5)".
+  - 44703784526: iOS16 `.sh` staging scripts excluded; every SWEET patch fails to apply to clean
+    xnu-12377 (e.g. `zz1-0004-sweet-machine-config.patch` -> `makedefs/MakeInc.def:29`), build again
+    fails `Unsupported CURRENT_MACHINE_CONFIG SWEET`, artifact has only build.log, no kernel.
+- This matches NOTES line 3253: the SWEET xnu-12377 tree was made by a **manual per-file 3-way merge**
+  of all 0001-0266 patches from xnu-8796 into Apple's xnu-12377 with conflicts resolved by hand;
+  the resulting tree/diffs live only in the user's ignored `work/xnu-12377`. `xnu/ios27/*.diff` are
+  incremental against that tree, so they cannot be applied to a clean xnu-12377 checkout.
+- BLOCKER (unchanged, now proven rather than assumed): (1) the SWEET/xnu-12377 kernel binary from
+  `work/xnu-12377`; (2) the iOS 27.2 root image — `research/ios27.2/{os-root,*-cryptex}.tar` and
+  `overlay/*-lowered.tar` plus `research/ios26/tools/lower-*.py` are all absent, and
+  `tools/mkios27root-mac.sh` needs macOS `hdiutil`/`sudo`. Neither can be produced in this Linux
+  session or by public CI with the committed patches. Do NOT flash userdata.
+- Next (user, on the Mac): supply the kernel at
+  `work/xnu-12377/BUILD/obj-ios26-sweet/DEVELOPMENT_ARM64_SWEET/mach.development.sweet` and the
+  lowered root tars/root image; then assemble with
+  `ADT_EXTRA="--identity d73 --scale2 --ram5g" tools/hotdog-mkboot.sh KERNEL
+  /home/ampekk/backups/hotdog-stock_boot_b.img shim/out/Image OUT.img "…args…"` and `mktripleboot.py`.
+
 # Handoff — first hotdog hardware boot test done; full iOS blocked on Mac-built artifacts (2026-11-20, OpenCode)
 - Device is connected and is a real hotdog: `adb devices -l` -> `8754d85f ... product:OnePlus7TPro
   model:HD1911 device:OnePlus7TPro transport_id:1`, recovery, adb shell is uid=0. `/proc/cmdline`:
