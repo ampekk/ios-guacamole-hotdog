@@ -15,7 +15,7 @@ jobs:
           git -C dxb fetch -q --depth 1 https://github.com/blacktop/darwin-xnu-build 663906528d1cd5ea8fde7de6f16de73db9511549
           git -C dxb checkout -q FETCH_HEAD
           mkdir -p dxb/patches/26.0
-          for f in xnu/patches/*.patch xnu/patches/*.sh; do
+          for f in xnu/patches/*.patch; do
             [ -f "$f" ] || continue
             cp "$f" "dxb/patches/26.0/zz1-$(basename "$f")"
           done
